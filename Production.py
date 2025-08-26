@@ -1,10 +1,10 @@
 # ukids_scheduler_app.py
-# uKids Scheduler — dynamic roles & capacities from spreadsheet headers + strict preferred-fill for Ages 9–11
+# uKids Scheduler — dynamic roles & capacities from spreadsheet headers + strict preferred-fill for Ages 9–11 + rescue pass
 # - Positions & capacities come from row-1 headers of the Positions CSV.
-#   Use "(xN)" / "[xN]" / "xN" suffix to declare capacity >1, e.g. "Info (x4)".
+#   Use "(xN)" / "[xN]" / "xN" / "×N" suffix to declare capacity >1, e.g. "Info (x4)" or "Poef Toets x3".
 #   Headers without a suffix default to capacity=1.
 # - Robust CSV ingestion
-# - Latest availability per person (by Timestamp)
+# - Latest availability per person (by Timestamp) — only most-recent response per name is used
 # - Names matched case/space-insensitively across files (display uses Positions name)
 # - Only people present in BOTH files can be scheduled
 # - Preferences: 0=not allowed; 1=must serve once; 2/3/4=can serve (prefer 2>3>4)
@@ -13,6 +13,7 @@
 # - One person per slot/date
 # - P1 pre-pass + "Unmet Priority-1" report
 # - STRICT preferred-fill order each Sunday: Age9 L, Age9 C, Age10 L, Age10 C, Age11 L, Age11 C
+# - Final rescue pass: re-fills any remaining gaps in the six preferred roles, including smart swaps
 # - "Helping ninja and check in leader" requires a uKids leader
 # - Excel export (Schedule, Assignment Summary w/ details, Fewer than 2 Yes, Unmet P1)
 
@@ -100,7 +101,16 @@ def norm_name(s: str) -> str:
     """Name normalizer: lower-case and collapse internal spaces."""
     return re.sub(r"\s+", " ", str(s).strip().lower())
 
-# Parse header like "Info (x4)" / "Info [x4]" / "Info x4" / "Info [4]" → ("Info", 4)
+def sanitize_header_text(s: str) -> str:
+    """Normalize funky whitespace and symbols so capacity parsing is reliable."""
+    if s is None:
+        return ""
+    s = str(s)
+    # Replace non-breaking spaces and Unicode multiplication sign
+    s = s.replace("\u00A0", " ").replace("×", "x")
+    return s.strip()
+
+# Parse header like "Info (x4)" / "Info [x4]" / "Info x4" / "Info [4]" / "Info ×4" → ("Info", 4)
 CAP_PATTERNS = [
     re.compile(r"^(?P<base>.*?)[\s\-]*\(\s*x?\s*(?P<n>\d+)\s*\)\s*$", re.IGNORECASE),
     re.compile(r"^(?P<base>.*?)[\s\-]*\[\s*x?\s*(?P<n>\d+)\s*\]\s*$", re.IGNORECASE),
@@ -109,11 +119,11 @@ CAP_PATTERNS = [
 
 def parse_role_and_capacity(header: str):
     """Return (base_label, capacity:int). Defaults to (header, 1) if no suffix."""
-    s = str(header).strip()
+    s = sanitize_header_text(header)
     for pat in CAP_PATTERNS:
         m = pat.match(s)
         if m:
-            base = m.group("base").strip()
+            base = sanitize_header_text(m.group("base"))
             n = int(m.group("n"))
             return (base if base else header, max(1, n))
     return (header, 1)
@@ -509,6 +519,91 @@ def main_pass_schedule(long_df, availability, service_dates, role_codes, all_rol
                 assign_count[chosen] += 1
                 assigned_today.add(chosen)
 
+    # FINAL RESCUE PASS — ensure preferred roles are filled if at all possible
+    def find_free_candidate_for(base_role, d, assigned_today_set):
+        """Find an eligible, under-cap person not assigned today."""
+        pool = []
+        for p in people:
+            flags = role_codes.get(p, {})
+            if assign_count[p] >= base_max_for_person(flags):
+                continue
+            if p in assigned_today_set:
+                continue
+            if not availability.get(p, {}).get(d, False):
+                continue
+            if not role_allowed_for_person(eligibility, p, base_role):
+                continue
+            if normalize(base_role) in REQUIRES_LEADER and not is_ukids_leader(flags):
+                continue
+            pr = get_priority_for(priority_lut, p, base_role)
+            pool.append((p, pr))
+        if not pool:
+            return None
+        pool.sort(key=lambda t: ((0 if t[1]==2 else 1 if t[1]==3 else 2 if t[1]==4 else 3 if t[1]==1 else 9), assign_count[t[0]], t[0]))
+        return pool[0][0]
+
+    def preferred_rank(base_role):
+        n = normalize(base_role)
+        return PREFERRED_INDEX.get(n, 999)
+
+    # index slots per date for quick scanning
+    for d in service_dates:
+        # Build day view
+        day_slots = [(row, slot_to_role[row]) for row in slot_rows]
+        assigned_today = {nm for (rn, dd), names in schedule_cells.items() if dd == d for nm in names}
+
+        # go through preferred roles in order
+        for target_role in PREFERRED_FILL_ORDER:
+            # find all rows for this base role (usually 1)
+            target_rows = [row for row, base in day_slots if normalize(base) == target_role]
+            for row in target_rows:
+                if len(schedule_cells[(row, d)]) >= 1:
+                    continue  # already filled
+
+                # 1) try a free candidate
+                cand = find_free_candidate_for(slot_to_role[row], d, assigned_today)
+                if cand:
+                    schedule_cells[(row, d)].append(cand)
+                    assign_count[cand] += 1
+                    assigned_today.add(cand)
+                    continue
+
+                # 2) try a swap: steal from lower-priority slot and backfill it
+                # collect donor slots on this date with strictly worse priority
+                donor_cells = []
+                for (r2, dd), names in schedule_cells.items():
+                    if dd != d or not names:
+                        continue
+                    base2 = slot_to_role[r2]
+                    if preferred_rank(base2) > preferred_rank(slot_to_role[row]):
+                        donor_cells.append((r2, base2, names[0]))  # one person per row
+
+                # choose a donor we can backfill after moving them
+                moved = False
+                for r2, base2, person in donor_cells:
+                    # can person do the target role?
+                    if not role_allowed_for_person(eligibility, person, slot_to_role[row]):
+                        continue
+                    if normalize(slot_to_role[row]) in REQUIRES_LEADER and not is_ukids_leader(role_codes.get(person, {})):
+                        continue
+                    # after moving, we must backfill r2 with a new free candidate
+                    # temporarily "free" the donor person from today
+                    temp_assigned = assigned_today - {person}
+                    backfill = find_free_candidate_for(base2, d, temp_assigned)
+                    if backfill is None:
+                        continue
+                    # perform swap
+                    schedule_cells[(r2, d)].remove(person)
+                    schedule_cells[(row, d)].append(person)
+                    schedule_cells[(r2, d)].append(backfill)
+                    # assign_count: person moved (no net change), backfill +1
+                    assign_count[backfill] += 1
+                    assigned_today.add(backfill)   # person was already counted; backfill now assigned
+                    moved = True
+                    break
+
+                # if moved is False, we leave it empty (no legal way to fill)
+
     return schedule_cells, assign_count, slot_rows, slot_to_role, eligibility, people, p1_roles_by_person
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -557,7 +652,7 @@ with c2:
     responses_file = st.file_uploader("Availability responses (CSV)", type=["csv"], key="responses_csv_any")
 
 st.caption("• Positions CSV: first col = volunteer names; second col = role codes (e.g., D/BL/PL/EL/SL); other cols = roles with values 0–5 (0 = not allowed, 1 = must serve once).")
-st.caption("• For multi-slot roles, add '(xN)' to the header, e.g., 'Info (x4)'.")
+st.caption("• For multi-slot roles, add capacity to the header, e.g., 'Info (x4)', 'Poef Toets x3', or 'Brooklyn preschool [x4]'.")
 st.caption("• Responses CSV: includes a name column and availability columns like 'Are you available 7 September?' plus a Timestamp column.")
 
 if st.button("Generate Schedule", type="primary"):
