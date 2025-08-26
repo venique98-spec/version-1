@@ -602,7 +602,23 @@ def main_pass_schedule(long_df, availability, service_dates, role_codes, all_rol
                     moved = True
                     break
 
-                # if moved is False, we leave it empty (no legal way to fill)
+                # 3) as a last resort, steal from a lower-priority slot WITHOUT backfilling it
+                #    This ensures all priority slots are filled even if it leaves a non-priority slot empty.
+                if not moved:
+                    for r2, base2, person in donor_cells:
+                        # can person do the target role?
+                        if not role_allowed_for_person(eligibility, person, slot_to_role[row]):
+                            continue
+                        if normalize(slot_to_role[row]) in REQUIRES_LEADER and not is_ukids_leader(role_codes.get(person, {})):
+                            continue
+                        # perform move without backfill of the donor slot
+                        schedule_cells[(r2, d)].remove(person)
+                        schedule_cells[(row, d)].append(person)
+                        # assign_count unchanged; person remains assigned once that day
+                        moved = True
+                        break
+
+                # if still not moved, we leave it empty (no legal way to fill)
 
     return schedule_cells, assign_count, slot_rows, slot_to_role, eligibility, people, p1_roles_by_person
 
