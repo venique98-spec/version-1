@@ -1,18 +1,19 @@
 # ukids_scheduler_app.py
-# uKids Scheduler (case-insensitive names + preferred-fill for Ages 9–11)
+# uKids Scheduler — dynamic roles & capacities from spreadsheet headers + strict preferred-fill for Ages 9–11
+# - Positions & capacities come from row-1 headers of the Positions CSV.
+#   Use "(xN)" / "[xN]" / "xN" suffix to declare capacity >1, e.g. "Info (x4)".
+#   Headers without a suffix default to capacity=1.
 # - Robust CSV ingestion
 # - Latest availability per person (by Timestamp)
 # - Names matched case/space-insensitively across files (display uses Positions name)
 # - Only people present in BOTH files can be scheduled
 # - Preferences: 0=not allowed; 1=must serve once; 2/3/4=can serve (prefer 2>3>4)
 # - Directors (D) only eligible for priority==1 roles
-# - Dynamic slot grid from Positions headers (3rd col onward), with capacities map
-# - Exclude "Entrance greeter"
+# - Exclude plain "Entrance greeter" (but not other greeter names you add)
 # - One person per slot/date
 # - P1 pre-pass + "Unmet Priority-1" report
-# - Preferred-fill: Age 9/10/11 leader & classroom first
+# - STRICT preferred-fill order each Sunday: Age9 L, Age9 C, Age10 L, Age10 C, Age11 L, Age11 C
 # - "Helping ninja and check in leader" requires a uKids leader
-# - Single "Age 9 classroom"
 # - Excel export (Schedule, Assignment Summary w/ details, Fewer than 2 Yes, Unmet P1)
 
 import io
@@ -75,118 +76,21 @@ MONTH_ALIASES = {
 YES_SET = {"yes", "y", "true", "available"}
 
 # Roles to exclude entirely (even if present in the Positions CSV)
-EXCLUDED_ROLES = {"entrance greeter"}  # removed per your request
+EXCLUDED_ROLES = {"entrance greeter"}  # removed per your earlier request
 
 # Special roles requiring a uKids leader (normalize()d names)
 REQUIRES_LEADER = {"helping ninja and check in leader"}
 
-# Preferred-fill roles when volunteers are scarce (scheduled first each Sunday)
-PREFERRED_FILL_ROLES = {
+# Preferred-fill roles in strict order (base labels, case/space-insensitive match)
+PREFERRED_FILL_ORDER = [
     "age 9 leader",
     "age 9 classroom",
     "age 10 leader",
     "age 10 classroom",
     "age 11 leader",
     "age 11 classroom",
-}
-
-# Capacities for known roles (case/spacing-insensitive match). Others default to 1.
-# Capacities for known roles (case/spacing-insensitive match). Others default to 1.
-DEFAULT_CAPS = {
-    # Age 1
-    "age 1 leader": 1,
-    "age 1 classroom": 5,
-    "age 1 nappies": 1,
-    "age 1 bags girls": 1,
-    "age 1 bags boys": 1,
-    # Age 2
-    "age 2 leader": 1,
-    "age 2 classroom": 4,
-    "age 2 nappies": 1,
-    "age 2 bags girls": 1,
-    "age 2 bags boys": 1,
-    # Age 3
-    "age 3 leader": 1,
-    "age 3 classroom": 4,
-    "age 3 bags": 1,
-    # Age 4
-    "age 4 leader": 1,
-    "age 4 classroom": 4,
-    # Age 5
-    "age 5 leader": 1,
-    "age 5 classroom": 3,
-    # Age 6
-    "age 6 leader": 1,
-    "age 6 classroom": 3,
-    # Age 7
-    "age 7 leader": 1,
-    "age 7 classroom": 2,
-    # Age 8
-    "age 8 leader": 1,
-    "age 8 classroom": 2,
-    # Age 9
-    "age 9 leader": 1,
-    "age 9 classroom": 1,
-    # Age 10
-    "age 10 leader": 1,
-    "age 10 classroom": 1,
-    # Age 11
-    "age 11 leader": 1,
-    "age 11 classroom": 1,
-
-    # Special Needs
-    "special needs leader": 1,
-    "special needs classroom": 2,
-
-    # Common extras
-    "info": 4,
-    "ukids setup": 4,
-    "outside assistant": 2,
-    "helping ninja and check in leader": 1,  # requires uKids leader
-    "helping ninja": 3,  # already updated earlier
-    "ukids hall": 4,
-
-    # Brooklyn
-    "brooklyn runner": 2,
-    "brooklyn babies leader": 1,
-    "brooklyn babies serving girl": 3,
-    "brooklyn preschool leader": 1,
-    "brooklyn preschool": 4,  # + leader => total 5
-
-    # NEW — requested additions
-    "ukids hall dancer": 2,            # “uKids hall Dancer” x2
-    "train driver": 1,
-    "kids production m": 1,
-    "kids production e": 1,
-    "kids propre m": 1,
-    "kids propre e": 1,
-    "kids announcements m": 1,
-    "kids announcements e": 1,
-    "offering m": 1,
-    "offering e": 1,
-    "kids dancer m": 1,
-    "kids dancer e": 1,
-    "entrance greeter m e": 4,         # “Entrance Greeter M&E” x4
-
-    # Tygerberg
-    "tygerberg babies": 3,             # x3
-    "tygerberg pre school": 3,         # x3
-    "tygerberg entrance greeter": 1,
-
-    # Nelspruit
-    "nelspruit babies": 2,             # x2
-    "nelspruit pre school": 2,         # x2
-    "nelspruit entrance greeter": 1,
-
-    # Polokwane (kept names exactly as provided)
-    "polokwane director check in": 1,
-    "polokwane greeter runner": 1,
-    "polokwane babies leader": 1,
-    "polokwane babies": 1,
-    "polokwnae pre school leader": 1,  # note: “Polokwnae” as given
-    "polokwane pre school": 1,
-}
-
+]
+PREFERRED_INDEX = {r: i for i, r in enumerate(PREFERRED_FILL_ORDER)}
 
 def normalize(s: str) -> str:
     """Generic normalizer for roles/headers."""
@@ -195,6 +99,29 @@ def normalize(s: str) -> str:
 def norm_name(s: str) -> str:
     """Name normalizer: lower-case and collapse internal spaces."""
     return re.sub(r"\s+", " ", str(s).strip().lower())
+
+# Parse header like "Info (x4)" / "Info [x4]" / "Info x4" / "Info [4]" → ("Info", 4)
+CAP_PATTERNS = [
+    re.compile(r"^(?P<base>.*?)[\s\-]*\(\s*x?\s*(?P<n>\d+)\s*\)\s*$", re.IGNORECASE),
+    re.compile(r"^(?P<base>.*?)[\s\-]*\[\s*x?\s*(?P<n>\d+)\s*\]\s*$", re.IGNORECASE),
+    re.compile(r"^(?P<base>.*?)[\s\-]*x\s*(?P<n>\d+)\s*$", re.IGNORECASE),
+]
+
+def parse_role_and_capacity(header: str):
+    """Return (base_label, capacity:int). Defaults to (header, 1) if no suffix."""
+    s = str(header).strip()
+    for pat in CAP_PATTERNS:
+        m = pat.match(s)
+        if m:
+            base = m.group("base").strip()
+            n = int(m.group("n"))
+            return (base if base else header, max(1, n))
+    return (header, 1)
+
+def strip_capacity_tag(role_label: str) -> str:
+    """Remove any capacity marker from a header for matching/eligibility."""
+    base, _ = parse_role_and_capacity(role_label)
+    return base
 
 def read_csv_robust(uploaded_file, label_for_error):
     """Read a Streamlit UploadedFile into a DataFrame, trying multiple encodings and separators."""
@@ -301,7 +228,7 @@ def build_display_name_map(positions_df: pd.DataFrame, name_col: str):
 def build_long_df(people_df: pd.DataFrame, name_col: str, role_cols, codes_col: str = None):
     """
     Returns:
-      - long_df with columns [person, role, priority]  (person is normalized key)
+      - long_df with columns [person_norm, role_header, priority]
       - role_codes flags per person_norm: has_D / has_BL / has_PL / has_EL / has_SL + raw_codes
     """
     records = []
@@ -319,21 +246,16 @@ def build_long_df(people_df: pd.DataFrame, name_col: str, role_cols, codes_col: 
             flags["raw"] = raw
             toks = re.findall(r"[A-Za-z]+", raw.upper())
             for t in toks:
-                if t == "D":
-                    flags["has_D"] = True
-                elif t == "BL":
-                    flags["has_BL"] = True
-                elif t == "PL":
-                    flags["has_PL"] = True
-                elif t == "EL":
-                    flags["has_EL"] = True
-                elif t == "SL":
-                    flags["has_SL"] = True
+                if t == "D": flags["has_D"] = True
+                elif t == "BL": flags["has_BL"] = True
+                elif t == "PL": flags["has_PL"] = True
+                elif t == "EL": flags["has_EL"] = True
+                elif t == "SL": flags["has_SL"] = True
         role_codes[person] = flags
 
-        # preferences per role
-        for role in role_cols:
-            pr = pd.to_numeric(r[role], errors="coerce")
+        # preferences per role (use header as-is; we'll strip capacity when matching)
+        for role_hdr in role_cols:
+            pr = pd.to_numeric(r[role_hdr], errors="coerce")
             if pd.isna(pr):
                 continue
             pr = int(round(pr))
@@ -341,7 +263,7 @@ def build_long_df(people_df: pd.DataFrame, name_col: str, role_cols, codes_col: 
                 # Directors only eligible for priority==1 roles
                 if flags["has_D"] and pr != 1:
                     continue
-                records.append({"person": person, "role": role, "priority": pr})
+                records.append({"person": person, "role": role_hdr, "priority": pr})
 
     return pd.DataFrame(records), role_codes
 
@@ -384,20 +306,20 @@ def parse_availability(responses_df: pd.DataFrame, name_col_resp: str, date_map)
     service_dates = sorted(set(date_map.values()))
     return availability, service_dates, few_yes, display_from_responses
 
+# Build slot plan from headers (strip capacity markers); combine duplicates by max capacity
 def build_slot_plan_dynamic(all_role_headers):
-    """Create {role_name: capacity} from the role headers, honoring DEFAULT_CAPS and exclusions."""
+    """
+    all_role_headers: list of headers from positions CSV (3rd column onward)
+    Returns: dict {base_role_label: capacity}
+    """
     slot_plan = {}
-    norm_caps = {normalize(k): v for k, v in DEFAULT_CAPS.items()}
     excluded = {normalize(x) for x in EXCLUDED_ROLES}
-    for role in all_role_headers:
-        if normalize(role) in excluded:
+    for hdr in all_role_headers:
+        base_label, cap = parse_role_and_capacity(hdr)
+        if normalize(base_label) in excluded:
             continue
-        cap = norm_caps.get(normalize(role), 1)
-        try:
-            cap_i = int(cap)
-        except Exception:
-            cap_i = 1
-        slot_plan[role] = max(1, cap_i)
+        # Take max if the same base label appears multiple times
+        slot_plan[base_label] = max(cap, slot_plan.get(base_label, 0))
     return slot_plan
 
 def expand_roles_to_slots(slot_plan):
@@ -419,17 +341,18 @@ def expand_roles_to_slots(slot_plan):
     return slot_rows, slot_index
 
 def build_eligibility(long_df: pd.DataFrame):
-    """Return {person_norm: set(roles)} for pr>=1."""
+    """Return {person_norm: set(role_headers)} for pr>=1 (headers kept as-is)."""
     elig = defaultdict(set)
     for _, r in long_df.iterrows():
         elig[str(r["person"]).strip()].add(str(r["role"]).strip())
     return elig
 
 def build_priority_lookup(long_df: pd.DataFrame):
-    """Return {(person_norm, role_norm): priority}."""
+    """Return {(person_norm, base_role_norm): priority}, using stripped base role."""
     lut = {}
     for _, r in long_df.iterrows():
-        lut[(str(r["person"]).strip(), normalize(r["role"]))] = int(r["priority"])
+        base = strip_capacity_tag(str(r["role"]))
+        lut[(str(r["person"]).strip(), normalize(base))] = int(r["priority"])
     return lut
 
 def is_ukids_leader(flags: dict) -> bool:
@@ -440,13 +363,10 @@ def base_max_for_person(flags: dict) -> int:
     return 1 if flags.get("has_D", False) else 2
 
 def role_allowed_for_person(eligibility, person_norm, base_role):
-    """Check if 'base_role' is allowed for 'person_norm' (pr>=1)."""
-    elig_roles = eligibility.get(person_norm, set())
-    if base_role in elig_roles:
-        return True
-    nb = normalize(base_role)
-    for er in elig_roles:
-        if normalize(er) == nb:
+    """Check if 'base_role' (stripped) is allowed for 'person_norm' (pr>=1)."""
+    nb = normalize(strip_capacity_tag(base_role))
+    for er in eligibility.get(person_norm, set()):
+        if normalize(strip_capacity_tag(er)) == nb:
             return True
     return False
 
@@ -459,18 +379,18 @@ def pref_rank(val):
     return 9
 
 def get_priority_for(lookup, person_norm, role_name):
-    return lookup.get((person_norm, normalize(role_name)))
+    return lookup.get((person_norm, normalize(strip_capacity_tag(role_name))))
 
 def compute_p1_roles_by_person(long_df, allowed_roles_set):
-    """Return {person_norm: set(roles with priority==1)}, filtered to allowed roles."""
+    """Return {person_norm: set(base_roles with priority==1)}, filtered to scheduled roles."""
     p1 = defaultdict(set)
-    allowed_norm = {normalize(r) for r in allowed_roles_set}
+    allowed_norm = {normalize(strip_capacity_tag(r)) for r in allowed_roles_set}
     for _, r in long_df.iterrows():
-        role = str(r["role"]).strip()
-        if normalize(role) not in allowed_norm:
+        base = strip_capacity_tag(str(r["role"]).strip())
+        if normalize(base) not in allowed_norm:
             continue
         if int(r["priority"]) == 1:
-            p1[str(r["person"]).strip()].add(role)
+            p1[str(r["person"]).strip()].add(base)
     return p1
 
 def served_in_priority_one(schedule_cells, p1_roles_by_person, slot_to_role):
@@ -487,7 +407,7 @@ def served_in_priority_one(schedule_cells, p1_roles_by_person, slot_to_role):
 # Scheduling
 # ──────────────────────────────────────────────────────────────────────────────
 def main_pass_schedule(long_df, availability, service_dates, role_codes, all_role_headers):
-    # Build slots dynamically (exclude removed roles)
+    # Build slots dynamically (exclude removed roles); headers may contain (xN)
     slot_plan = build_slot_plan_dynamic(all_role_headers)
     slot_rows, slot_to_role = expand_roles_to_slots(slot_plan)
 
@@ -501,16 +421,13 @@ def main_pass_schedule(long_df, availability, service_dates, role_codes, all_rol
     schedule_cells = {(slot, d): [] for slot in slot_rows for d in service_dates}
     assign_count = defaultdict(int)
 
-    # Prepare preferred-fill set (normalized)
-    pref_norm = {normalize(r) for r in PREFERRED_FILL_ROLES}
-
     def slot_sort_key(s):
-        """Order slots so preferred-fill roles come first, then other leaders, classrooms, others."""
+        """Order slots so preferred-fill roles come first IN EXACT ORDER, then other leaders, classrooms, others."""
         base_role = slot_to_role[s]
         n = normalize(base_role)
+        if n in PREFERRED_INDEX:
+            return (0, PREFERRED_INDEX[n], s.lower())  # strict order you requested
         s_low = s.lower()
-        if n in pref_norm:
-            return (0, s_low)          # TOP priority: preferred roles
         if "leader" in s_low:
             return (1, s_low)
         if "classroom" in s_low:
@@ -640,6 +557,7 @@ with c2:
     responses_file = st.file_uploader("Availability responses (CSV)", type=["csv"], key="responses_csv_any")
 
 st.caption("• Positions CSV: first col = volunteer names; second col = role codes (e.g., D/BL/PL/EL/SL); other cols = roles with values 0–5 (0 = not allowed, 1 = must serve once).")
+st.caption("• For multi-slot roles, add '(xN)' to the header, e.g., 'Info (x4)'.")
 st.caption("• Responses CSV: includes a name column and availability columns like 'Are you available 7 September?' plus a Timestamp column.")
 
 if st.button("Generate Schedule", type="primary"):
@@ -669,13 +587,14 @@ if st.button("Generate Schedule", type="primary"):
     positions_df[name_col_positions] = positions_df[name_col_positions].astype(str)
     responses_df[name_col_responses] = responses_df[name_col_responses].astype(str)
 
-    # Build a display-name map (prefer Positions casing), plus normalized keys for joining
+    # Display name map (prefer Positions casing), plus normalized keys
     name_display_map = build_display_name_map(positions_df, name_col_positions)
 
-    # Role columns (from third column onward) — define all locations to schedule (after exclusions)
-    role_cols_all = [c for c in positions_df.columns[2:] if is_priority_col(positions_df[c])]
+    # Role columns (from third column onward) — define all locations to schedule
+    raw_role_cols = [c for c in positions_df.columns[2:] if is_priority_col(positions_df[c])]
+    # Exclude plain "Entrance greeter"
     excluded_norm = {normalize(x) for x in EXCLUDED_ROLES}
-    role_cols = [c for c in role_cols_all if normalize(c) not in excluded_norm]
+    role_cols = [c for c in raw_role_cols if normalize(strip_capacity_tag(c)) not in excluded_norm]
     if not role_cols:
         st.error("No usable role columns detected in positions CSV (from the third column onwards).")
         st.stop()
