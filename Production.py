@@ -1,7 +1,8 @@
 # ukids_scheduler_app.py
-# uKids Scheduler (full rewrite)
+# uKids Scheduler (case-insensitive names + preferred-fill for Ages 9–11)
 # - Robust CSV ingestion
 # - Latest availability per person (by Timestamp)
+# - Names matched case/space-insensitively across files (display uses Positions name)
 # - Only people present in BOTH files can be scheduled
 # - Preferences: 0=not allowed; 1=must serve once; 2/3/4=can serve (prefer 2>3>4)
 # - Directors (D) only eligible for priority==1 roles
@@ -9,6 +10,7 @@
 # - Exclude "Entrance greeter"
 # - One person per slot/date
 # - P1 pre-pass + "Unmet Priority-1" report
+# - Preferred-fill: Age 9/10/11 leader & classroom first
 # - "Helping ninja and check in leader" requires a uKids leader
 # - Single "Age 9 classroom"
 # - Excel export (Schedule, Assignment Summary w/ details, Fewer than 2 Yes, Unmet P1)
@@ -78,6 +80,17 @@ EXCLUDED_ROLES = {"entrance greeter"}  # removed per your request
 # Special roles requiring a uKids leader (normalize()d names)
 REQUIRES_LEADER = {"helping ninja and check in leader"}
 
+# Preferred-fill roles when volunteers are scarce (scheduled first each Sunday)
+PREFERRED_FILL_ROLES = {
+    "age 9 leader",
+    "age 9 classroom",
+    "age 10 leader",
+    "age 10 classroom",
+    "age 11 leader",
+    "age 11 classroom",
+}
+
+# Capacities for known roles (case/spacing-insensitive match). Others default to 1.
 # Capacities for known roles (case/spacing-insensitive match). Others default to 1.
 DEFAULT_CAPS = {
     # Age 1
@@ -120,26 +133,68 @@ DEFAULT_CAPS = {
     # Age 11
     "age 11 leader": 1,
     "age 11 classroom": 1,
+
     # Special Needs
     "special needs leader": 1,
     "special needs classroom": 2,
+
     # Common extras
     "info": 4,
     "ukids setup": 4,
     "outside assistant": 2,
     "helping ninja and check in leader": 1,  # requires uKids leader
-    "helping ninja": 3,  # ← updated from 2 to 3
+    "helping ninja": 3,  # already updated earlier
     "ukids hall": 4,
-    # Brooklyn (your requested capacities)
+
+    # Brooklyn
     "brooklyn runner": 2,
     "brooklyn babies leader": 1,
     "brooklyn babies serving girl": 3,
     "brooklyn preschool leader": 1,
     "brooklyn preschool": 4,  # + leader => total 5
+
+    # NEW — requested additions
+    "ukids hall dancer": 2,            # “uKids hall Dancer” x2
+    "train driver": 1,
+    "kids production m": 1,
+    "kids production e": 1,
+    "kids propre m": 1,
+    "kids propre e": 1,
+    "kids announcements m": 1,
+    "kids announcements e": 1,
+    "offering m": 1,
+    "offering e": 1,
+    "kids dancer m": 1,
+    "kids dancer e": 1,
+    "entrance greeter m e": 4,         # “Entrance Greeter M&E” x4
+
+    # Tygerberg
+    "tygerberg babies": 3,             # x3
+    "tygerberg pre school": 3,         # x3
+    "tygerberg entrance greeter": 1,
+
+    # Nelspruit
+    "nelspruit babies": 2,             # x2
+    "nelspruit pre school": 2,         # x2
+    "nelspruit entrance greeter": 1,
+
+    # Polokwane (kept names exactly as provided)
+    "polokwane director check in": 1,
+    "polokwane greeter runner": 1,
+    "polokwane babies leader": 1,
+    "polokwane babies": 1,
+    "polokwnae pre school leader": 1,  # note: “Polokwnae” as given
+    "polokwane pre school": 1,
 }
 
+
 def normalize(s: str) -> str:
+    """Generic normalizer for roles/headers."""
     return re.sub(r"[^a-z0-9]+", " ", str(s).lower()).strip()
+
+def norm_name(s: str) -> str:
+    """Name normalizer: lower-case and collapse internal spaces."""
+    return re.sub(r"\s+", " ", str(s).strip().lower())
 
 def read_csv_robust(uploaded_file, label_for_error):
     """Read a Streamlit UploadedFile into a DataFrame, trying multiple encodings and separators."""
@@ -234,18 +289,28 @@ def parse_month_and_dates_from_headers(responses_df: pd.DataFrame):
 # ──────────────────────────────────────────────────────────────────────────────
 # Data shaping
 # ──────────────────────────────────────────────────────────────────────────────
+def build_display_name_map(positions_df: pd.DataFrame, name_col: str):
+    """Prefer display casing from Positions file."""
+    disp = {}
+    for _, r in positions_df.iterrows():
+        raw = str(r[name_col]).strip()
+        if raw:
+            disp.setdefault(norm_name(raw), raw)
+    return disp
+
 def build_long_df(people_df: pd.DataFrame, name_col: str, role_cols, codes_col: str = None):
     """
     Returns:
-      - long_df with columns [person, role, priority]
-      - role_codes flags per person: has_D / has_BL / has_PL / has_EL / has_SL + raw_codes
+      - long_df with columns [person, role, priority]  (person is normalized key)
+      - role_codes flags per person_norm: has_D / has_BL / has_PL / has_EL / has_SL + raw_codes
     """
     records = []
     role_codes = {}
     for _, r in people_df.iterrows():
-        person = str(r[name_col]).strip()
-        if not person or person.lower() == "nan":
+        display_name = str(r[name_col]).strip()
+        if not display_name or display_name.lower() == "nan":
             continue
+        person = norm_name(display_name)  # normalized key
 
         # parse code flags (2nd column)
         flags = {"has_D": False, "has_BL": False, "has_PL": False, "has_EL": False, "has_SL": False, "raw": ""}
@@ -280,36 +345,44 @@ def build_long_df(people_df: pd.DataFrame, name_col: str, role_cols, codes_col: 
 
     return pd.DataFrame(records), role_codes
 
-def dedupe_latest_by_name(df: pd.DataFrame, name_col: str) -> pd.DataFrame:
-    """Keep only the most recent response per person using 'Timestamp' when present."""
-    if "Timestamp" in df.columns:
-        ts = pd.to_datetime(df["Timestamp"], errors="coerce")
-        df2 = df.assign(_ts=ts).sort_values("_ts")
-        latest = df2.groupby(name_col, as_index=False).tail(1).drop(columns=["_ts"])
+def dedupe_latest_by_key(df: pd.DataFrame, key_series: pd.Series) -> pd.DataFrame:
+    """Keep only the most recent row per normalized key using 'Timestamp' when present."""
+    key_norm = key_series.map(norm_name)
+    df2 = df.assign(_key=key_norm)
+    if "Timestamp" in df2.columns:
+        ts = pd.to_datetime(df2["Timestamp"], errors="coerce")
+        df2 = df2.assign(_ts=ts).sort_values("_ts")
+        latest = df2.groupby("_key", as_index=False).tail(1).drop(columns=["_ts"])
         return latest
-    # Fallback: keep last seen per person
-    return df.groupby(name_col, as_index=False).tail(1)
+    # Fallback: keep last seen per key
+    return df2.groupby("_key", as_index=False).tail(1)
 
 def parse_availability(responses_df: pd.DataFrame, name_col_resp: str, date_map):
-    # Only latest response per person
-    responses_latest = dedupe_latest_by_name(responses_df, name_col_resp)
+    # Only latest response per normalized name
+    responses_latest = dedupe_latest_by_key(responses_df, responses_df[name_col_resp])
 
     availability = {}
     yes_counts = Counter()
+    display_from_responses = {}
+
     for _, row in responses_latest.iterrows():
-        nm = str(row.get(name_col_resp, "")).strip()
-        if not nm or nm.lower() == "nan":
+        disp_name = str(row.get(name_col_resp, "")).strip()
+        key = str(row.get("_key", "")).strip()
+        if not key or key.lower() == "nan":
             continue
-        availability.setdefault(nm, {})
+        display_from_responses[key] = disp_name
+
+        availability.setdefault(key, {})
         for col, dt in date_map.items():
             ans = str(row.get(col, "")).strip().lower()
             is_yes = ans in YES_SET
-            availability[nm][dt] = is_yes
+            availability[key][dt] = is_yes
             if is_yes:
-                yes_counts[nm] += 1
+                yes_counts[key] += 1
+
     few_yes = sorted([n for n, c in yes_counts.items() if c < 2])
     service_dates = sorted(set(date_map.values()))
-    return availability, service_dates, few_yes
+    return availability, service_dates, few_yes, display_from_responses
 
 def build_slot_plan_dynamic(all_role_headers):
     """Create {role_name: capacity} from the role headers, honoring DEFAULT_CAPS and exclusions."""
@@ -346,7 +419,7 @@ def expand_roles_to_slots(slot_plan):
     return slot_rows, slot_index
 
 def build_eligibility(long_df: pd.DataFrame):
-    """Return {person: set(roles)} for pr>=1."""
+    """Return {person_norm: set(roles)} for pr>=1."""
     elig = defaultdict(set)
     for _, r in long_df.iterrows():
         elig[str(r["person"]).strip()].add(str(r["role"]).strip())
@@ -356,7 +429,7 @@ def build_priority_lookup(long_df: pd.DataFrame):
     """Return {(person_norm, role_norm): priority}."""
     lut = {}
     for _, r in long_df.iterrows():
-        lut[(normalize(r["person"]), normalize(r["role"]))] = int(r["priority"])
+        lut[(str(r["person"]).strip(), normalize(r["role"]))] = int(r["priority"])
     return lut
 
 def is_ukids_leader(flags: dict) -> bool:
@@ -366,9 +439,9 @@ def base_max_for_person(flags: dict) -> int:
     # Monthly caps: Director=1, others=2
     return 1 if flags.get("has_D", False) else 2
 
-def role_allowed_for_person(eligibility, person, base_role):
-    """Check if 'base_role' is allowed for 'person' (pr>=1)."""
-    elig_roles = eligibility.get(person, set())
+def role_allowed_for_person(eligibility, person_norm, base_role):
+    """Check if 'base_role' is allowed for 'person_norm' (pr>=1)."""
+    elig_roles = eligibility.get(person_norm, set())
     if base_role in elig_roles:
         return True
     nb = normalize(base_role)
@@ -385,11 +458,11 @@ def pref_rank(val):
     if val == 1: return 3
     return 9
 
-def get_priority_for(lookup, person, role_name):
-    return lookup.get((normalize(person), normalize(role_name)))
+def get_priority_for(lookup, person_norm, role_name):
+    return lookup.get((person_norm, normalize(role_name)))
 
 def compute_p1_roles_by_person(long_df, allowed_roles_set):
-    """Return {person: set(roles with priority==1)}, filtered to allowed roles."""
+    """Return {person_norm: set(roles with priority==1)}, filtered to allowed roles."""
     p1 = defaultdict(set)
     allowed_norm = {normalize(r) for r in allowed_roles_set}
     for _, r in long_df.iterrows():
@@ -400,14 +473,14 @@ def compute_p1_roles_by_person(long_df, allowed_roles_set):
             p1[str(r["person"]).strip()].add(role)
     return p1
 
-def served_in_priority_one(assignments_by_cell, p1_roles_by_person, slot_to_role):
-    """Return set of people who got any slot whose base role is in their P1 list."""
+def served_in_priority_one(schedule_cells, p1_roles_by_person, slot_to_role):
+    """Return set of person_norm who got any slot whose base role is in their P1 list."""
     served = set()
     for (row_name, _d), names in schedule_cells.items():
         base_role = slot_to_role.get(row_name, row_name)
-        for nm in names:
-            if base_role in p1_roles_by_person.get(nm, set()):
-                served.add(nm)
+        for nm_norm in names:
+            if base_role in p1_roles_by_person.get(nm_norm, set()):
+                served.add(nm_norm)
     return served
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -421,26 +494,35 @@ def main_pass_schedule(long_df, availability, service_dates, role_codes, all_rol
     eligibility = build_eligibility(long_df)
     priority_lut = build_priority_lookup(long_df)
 
-    # Only schedule people present in BOTH data sources
+    # Only schedule people present in BOTH data sources (keys are normalized)
     people = sorted(set(eligibility.keys()) & set(availability.keys()))
 
-    # {(row_label, date): [person]}
-    global schedule_cells  # used in served_in_priority_one helper above
+    # {(row_label, date): [person_norm]}
     schedule_cells = {(slot, d): [] for slot in slot_rows for d in service_dates}
     assign_count = defaultdict(int)
 
+    # Prepare preferred-fill set (normalized)
+    pref_norm = {normalize(r) for r in PREFERRED_FILL_ROLES}
+
     def slot_sort_key(s):
+        """Order slots so preferred-fill roles come first, then other leaders, classrooms, others."""
+        base_role = slot_to_role[s]
+        n = normalize(base_role)
         s_low = s.lower()
-        if "leader" in s_low: return (0, s_low)
-        if "classroom" in s_low: return (1, s_low)
-        return (2, s_low)
+        if n in pref_norm:
+            return (0, s_low)          # TOP priority: preferred roles
+        if "leader" in s_low:
+            return (1, s_low)
+        if "classroom" in s_low:
+            return (2, s_low)
+        return (3, s_low)
 
     slot_rows_sorted = sorted(slot_rows, key=slot_sort_key)
 
     # P1 pre-pass: try to give each P1-eligible person exactly one P1 slot
     p1_roles_by_person = compute_p1_roles_by_person(long_df, allowed_roles_set=slot_plan.keys())
     avail_count = {p: sum(1 for d in service_dates if availability.get(p, {}).get(d, False)) for p in people}
-    p1_people_order = sorted([p for p in people if p1_roles_by_person.get(p)], key=lambda p: (avail_count.get(p, 0), p.lower()))
+    p1_people_order = sorted([p for p in people if p1_roles_by_person.get(p)], key=lambda p: (avail_count.get(p, 0), p))
 
     for p in p1_people_order:
         flags = role_codes.get(p, {})
@@ -454,7 +536,7 @@ def main_pass_schedule(long_df, availability, service_dates, role_codes, all_rol
             # already assigned that day?
             if any(p in names for (rn, dd), names in schedule_cells.items() if dd == d):
                 continue
-            # find a free P1 slot
+            # find a free P1 slot (preferred-fill slots appear earlier in slot_rows_sorted)
             for slot_row in slot_rows_sorted:
                 base_role = slot_to_role[slot_row]
                 if base_role not in p1_roles_by_person[p]:
@@ -474,7 +556,7 @@ def main_pass_schedule(long_df, availability, service_dates, role_codes, all_rol
                 break
         # if not got_one, they’ll appear in "Unmet P1" later
 
-    # General fill
+    # General fill (preferred-fill slots still come first)
     for d in service_dates:
         # set of people already on this date
         assigned_today = set(nm for (rn, dd), names in schedule_cells.items() if dd == d for nm in names)
@@ -504,7 +586,7 @@ def main_pass_schedule(long_df, availability, service_dates, role_codes, all_rol
 
             if cands:
                 # sort by (fewest assignments so far, best preference rank, then name)
-                cands.sort(key=lambda t: (assign_count[t[0]], pref_rank(t[1]), t[0].lower()))
+                cands.sort(key=lambda t: (assign_count[t[0]], (0 if t[1]==2 else 1 if t[1]==3 else 2 if t[1]==4 else 3 if t[1]==1 else 9), t[0]))
                 chosen = cands[0][0]
                 schedule_cells[(slot_row, d)].append(chosen)
                 assign_count[chosen] += 1
@@ -525,23 +607,26 @@ def excel_autofit(ws):
             max_len = max(max_len, len(val))
         ws.column_dimensions[get_column_letter(col_idx)].width = min(max(12, max_len + 2), 80)
 
-def build_schedule_df(schedule_cells, slot_rows, service_dates):
+def build_schedule_df(schedule_cells, slot_rows, service_dates, name_display_map):
     cols = [d.strftime("%Y-%m-%d") for d in service_dates]
     df = pd.DataFrame(index=slot_rows, columns=cols)
     for (slot_row, d), names in schedule_cells.items():
-        df.loc[slot_row, d.strftime("%Y-%m-%d")] = ", ".join(names)
+        # map normalized names to display names (fallback to the key if missing)
+        disp = [name_display_map.get(nm, nm) for nm in names]
+        df.loc[slot_row, d.strftime("%Y-%m-%d")] = ", ".join(disp)
     return df.fillna("")
 
-def build_person_assignment_details(schedule_cells):
-    """Return dict: person -> 'YYYY-MM-DD — Slot; ...' (sorted by date)."""
+def build_person_assignment_details(schedule_cells, name_display_map):
+    """Return dict: display_name -> 'YYYY-MM-DD — Slot; ...' (sorted by date)."""
     per = defaultdict(list)
     for (slot_row, d), names in schedule_cells.items():
-        for nm in names:
-            per[nm].append((d, slot_row))
+        for nm_norm in names:
+            per[nm_norm].append((d, slot_row))
     details = {}
-    for nm, items in per.items():
+    for nm_norm, items in per.items():
         items_sorted = sorted(items, key=lambda x: x[0])
-        details[nm] = "; ".join([f"{dt.strftime('%Y-%m-%d')} — {slot}" for dt, slot in items_sorted])
+        disp_name = name_display_map.get(nm_norm, nm_norm)
+        details[disp_name] = "; ".join([f"{dt.strftime('%Y-%m-%d')} — {slot}" for dt, slot in items_sorted])
     return details
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -584,6 +669,9 @@ if st.button("Generate Schedule", type="primary"):
     positions_df[name_col_positions] = positions_df[name_col_positions].astype(str)
     responses_df[name_col_responses] = responses_df[name_col_responses].astype(str)
 
+    # Build a display-name map (prefer Positions casing), plus normalized keys for joining
+    name_display_map = build_display_name_map(positions_df, name_col_positions)
+
     # Role columns (from third column onward) — define all locations to schedule (after exclusions)
     role_cols_all = [c for c in positions_df.columns[2:] if is_priority_col(positions_df[c])]
     excluded_norm = {normalize(x) for x in EXCLUDED_ROLES}
@@ -592,7 +680,7 @@ if st.button("Generate Schedule", type="primary"):
         st.error("No usable role columns detected in positions CSV (from the third column onwards).")
         st.stop()
 
-    # Build eligibility (+ role code flags)
+    # Build eligibility (+ role code flags) — keys are normalized names
     long_df, role_codes = build_long_df(positions_df, name_col_positions, role_cols, codes_col=codes_col)
     if long_df.empty:
         st.error("No eligible assignments found (after applying Director=1-only rule and removing 0s).")
@@ -605,16 +693,20 @@ if st.button("Generate Schedule", type="primary"):
         st.error(f"Could not parse month & dates from responses: {e}")
         st.stop()
 
-    # Availability (latest response per person)
-    availability, service_dates, few_yes_list = parse_availability(responses_df, name_col_responses, date_map)
+    # Availability (latest response per normalized name)
+    availability, service_dates, few_yes_list_norm, display_from_responses = parse_availability(responses_df, name_col_responses, date_map)
 
-    # MAIN scheduling
-    schedule_cells, assign_count, slot_rows, slot_to_role, eligibility, people, p1_roles_by_person = main_pass_schedule(
+    # Update display map with response names only for keys missing from Positions
+    for k, disp in display_from_responses.items():
+        name_display_map.setdefault(k, disp)
+
+    # MAIN scheduling (uses normalized keys)
+    schedule_cells, assign_count_norm, slot_rows, slot_to_role, eligibility, people_norm, p1_roles_by_person = main_pass_schedule(
         long_df, availability, service_dates, role_codes, all_role_headers=role_cols
     )
 
-    # Build schedule table
-    schedule_df = build_schedule_df(schedule_cells, slot_rows, service_dates)
+    # Build schedule table (render display names)
+    schedule_df = build_schedule_df(schedule_cells, slot_rows, service_dates, name_display_map)
 
     # Stats
     total_slots = schedule_df.size
@@ -623,19 +715,25 @@ if st.button("Generate Schedule", type="primary"):
     unfilled = total_slots - filled_slots
 
     # Per-person summary (+ details)
+    per_series = pd.Series(assign_count_norm, name="Assignments")
+    # map normalized index to display names
+    per_series.index = [name_display_map.get(k, k) for k in per_series.index]
     per_person = (
-        pd.Series(assign_count, name="Assignments")
-        .sort_values(ascending=False)
+        per_series.sort_values(ascending=False)
         .reset_index()
         .rename(columns={"index": "Person"})
     )
-    details_lookup = build_person_assignment_details(schedule_cells)
+    details_lookup = build_person_assignment_details(schedule_cells, name_display_map)
     per_person["Locations & Dates"] = per_person["Person"].map(lambda nm: details_lookup.get(nm, ""))
 
-    # Unmet P1 list
-    served_p1_people = served_in_priority_one(schedule_cells, p1_roles_by_person, slot_to_role)
-    p1_people = sorted([p for p in people if p1_roles_by_person.get(p)])
-    unmet_p1 = [p for p in p1_people if p not in served_p1_people]
+    # <2 yes list — convert to display
+    few_yes_display = [name_display_map.get(k, k) for k in few_yes_list_norm]
+
+    # Unmet P1 list — compute with normalized keys, then display
+    served_p1_people_norm = served_in_priority_one(schedule_cells, p1_roles_by_person, slot_to_role)
+    p1_people_norm = sorted([p for p in people_norm if p1_roles_by_person.get(p)])
+    unmet_p1_norm = [p for p in p1_people_norm if p not in served_p1_people_norm]
+    unmet_p1_display = [name_display_map.get(k, k) for k in unmet_p1_norm]
 
     st.success(f"Schedule generated for **{sheet_name}**")
     st.write(f"Filled slots: **{filled_slots} / {total_slots}**  (Fill rate: **{fill_rate:.1%}**)  •  Unfilled: **{unfilled}**")
@@ -647,23 +745,27 @@ if st.button("Generate Schedule", type="primary"):
     st.dataframe(per_person, use_container_width=True)
 
     st.subheader("People with < 2 'Yes' dates (for reference only)")
-    few_yes_df = pd.DataFrame({"Person": few_yes_list})
+    few_yes_df = pd.DataFrame({"Person": few_yes_display})
     st.dataframe(few_yes_df, use_container_width=True)
 
-    if unmet_p1:
+    if unmet_p1_display:
         st.subheader("Unmet Priority-1 requirement (info)")
         st.caption("These volunteers have at least one Priority-1 location but were not scheduled into any Priority-1 slot (capacity/availability constraints).")
-        st.dataframe(pd.DataFrame({"Person": unmet_p1}), use_container_width=True)
+        st.dataframe(pd.DataFrame({"Person": unmet_p1_display}), use_container_width=True)
 
     # Excel export
     wb = Workbook()
-    ws = wb.active
+    ws = wb.create_sheet(sheet_name) if wb.active.title != "Sheet" else wb.active
     ws.title = sheet_name
 
     header = ["Position / Slot"] + [d.strftime("%Y-%m-%d") for d in service_dates]
     ws.append(header)
     for row_name in slot_rows:
-        row_vals = [row_name] + [", ".join(schedule_cells[(row_name, d)]) for d in service_dates]
+        # render display names
+        row_vals = [row_name] + [
+            ", ".join([name_display_map.get(nm, nm) for nm in schedule_cells[(row_name, d)]])
+            for d in service_dates
+        ]
         ws.append(row_vals)
     excel_autofit(ws)
 
@@ -673,17 +775,17 @@ if st.button("Generate Schedule", type="primary"):
         ws3.append([r["Person"], int(r["Assignments"]), r.get("Locations & Dates", "")])
     excel_autofit(ws3)
 
-    if few_yes_list:
+    if few_yes_display:
         ws2 = wb.create_sheet("Fewer than 2 Yes (info)")
         ws2.append(["Person"])
-        for p in few_yes_list:
+        for p in few_yes_display:
             ws2.append([p])
         excel_autofit(ws2)
 
-    if unmet_p1:
+    if unmet_p1_display:
         ws4 = wb.create_sheet("Unmet Priority-1 (info)")
         ws4.append(["Person"])
-        for p in unmet_p1:
+        for p in unmet_p1_display:
             ws4.append([p])
         excel_autofit(ws4)
 
