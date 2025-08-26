@@ -128,7 +128,7 @@ DEFAULT_CAPS = {
     "ukids setup": 4,
     "outside assistant": 2,
     "helping ninja and check in leader": 1,  # requires uKids leader
-    "helping ninja": 2,
+    "helping ninja": 3,
     "ukids hall": 4,
     # Brooklyn (your requested capacities)
     "brooklyn runner": 2,
