@@ -1,6 +1,6 @@
 # ukids_scheduler_app.py
 # uKids Scheduler — dynamic roles/capacities from Positions CSV headers + per-role '#' extra cap, starred overflow, Brooklyn rotation,
-# P1 pre-pass, preferred Age9→11 rescue, latest responses only, 0=never, no double-booking, Excel export.
+# P1 pre-pass, preferred leader rescue (Age 1→11 + Brooklyn babies/preschool leaders), latest responses only, 0=never, no double-booking, Excel export.
 # NOTE: All Director-specific rules have been removed. Everyone has the same base cap.
 # NEW: Adds an output that lists, per date, people who said YES but were not scheduled that day — with a second column
 #      showing each person's role code (e.g., PSG, BSG). Also exported to Excel as paired columns per date.
@@ -65,22 +65,30 @@ EXCLUDED_ROLES = {"entrance greeter"}
 REQUIRES_LEADER = {"helping ninja and check in leader"}
 
 # Strict per-Sunday preferred-fill for rescue
+# UPDATED: Prioritize these roles (in this exact order) before all others
 PREFERRED_FILL_ORDER = [
+    "age 1 leader",
+    "age 2 leader",
+    "age 3 leader",
+    "age 4 leader",
+    "age 5 leader",
+    "age 6 leader",
+    "age 7 leader",
+    "age 8 leader",
     "age 9 leader",
-    "age 9 classroom",
     "age 10 leader",
-    "age 10 classroom",
     "age 11 leader",
-    "age 11 classroom",
+    "brooklyn babies leader",
+    "brooklyn preschool leader",
 ]
 PREFERRED_INDEX = {r: i for i, r in enumerate(PREFERRED_FILL_ORDER)}
 
 # Recognized short codes as they appear in column 2 (role codes)
 KNOWN_CODES_ORDER = [
     "BSG", "PSG", "ESG", "DSG",  # serving girls
-    "BL", "PL", "EL", "SL",        # leaders
-    "UL", "USG",                      # uGroup
-    "D",                               # director (no special rules)
+    "BL", "PL", "EL", "SL",      # leaders
+    "UL", "USG",                 # uGroup
+    "D",                         # director (no special rules)
 ]
 
 
@@ -710,7 +718,7 @@ def main_pass_schedule(long_df, availability, service_dates, role_codes, all_rol
 
     assign_count = recompute_assign_counts(schedule_cells)
 
-    # Preferred roles rescue for Age 9→11
+    # Preferred roles rescue (UPDATED LIST)
     def pref_rank(base_role):
         return PREFERRED_INDEX.get(normalize(base_role), 999)
 
@@ -930,6 +938,7 @@ st.caption("• To give someone +1 extra assignment but ONLY for a specific role
 st.caption("• For capacity add '(xN)' / 'xN' / '[xN]' to headers. Add '*' at end to mark starred roles (eligible for +1 overflow after base cap).")
 st.caption("• Responses CSV: has a name column + availability columns like '05-Oct' or 'Are you available 7 September?' and a Timestamp.")
 st.caption("• Exclusions (optional): List of names who served in Brooklyn last month. They’re blocked from all Brooklyn roles and get P1 priority.")
+st.caption("• Priority rescue order: Age 1→11 Leaders, then Brooklyn Babies Leader, then Brooklyn Preschool Leader.")
 
 if st.button("Generate Schedule", type="primary"):
     if not positions_file or not responses_file:
