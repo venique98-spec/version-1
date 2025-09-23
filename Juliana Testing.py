@@ -1,6 +1,8 @@
 # ukids_scheduler_app.py
-# uKids Scheduler – dynamic positions from CSV headers, starred overflow, Brooklyn rotation priority & swap,
-# P1 pre-pass, preferred Age9-11 fill order + rescue, latest responses only, Excel export.
+# uKids Scheduler — dynamic roles/capacities from Positions CSV headers + per-role '#' extra cap, starred overflow, Brooklyn rotation,
+# P1 pre-pass, preferred Age9→11 rescue, latest responses only, 0=never, no double-booking, Excel export.
+# NOTE: All Director-specific rules have been removed. Everyone has the same base cap.
+# NEW: Adds a second output/list: for each date, people who said YES but were not scheduled that day (even if they served on other dates).
 
 import io
 import re
@@ -8,7 +10,6 @@ import base64
 from collections import defaultdict, Counter
 from datetime import datetime, date
 
-import numpy as np
 import pandas as pd
 import streamlit as st
 from openpyxl import Workbook
@@ -32,16 +33,16 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Optional logo
+# Optional logo (ignore if missing)
 for logo_name in ["image(1).png", "image.png", "logo.png"]:
     try:
         with open(logo_name, "rb") as f:
             encoded = base64.b64encode(f.read()).decode()
-            st.markdown(
-                f"<div style='text-align:center'><img src='data:image/png;base64,{encoded}' width='520'></div>",
-                unsafe_allow_html=True,
-            )
-            break
+        st.markdown(
+            f"<div style='text-align:center'><img src='data:image/png;base64,{encoded}' width='520'></div>",
+            unsafe_allow_html=True,
+        )
+        break
     except Exception:
         pass
 
@@ -56,13 +57,13 @@ MONTH_ALIASES = {
 }
 YES_SET = {"yes", "y", "true", "available"}
 
-# Roles to ignore entirely (as raw base labels, case/space-insensitive)
-EXCLUDED_ROLES = {"entrance greeter"}  # keep "Entrance greeter" out; variants you add (e.g., M&E) will still work.
+# Remove these roles entirely (match on base label)
+EXCLUDED_ROLES = {"entrance greeter"}
 
-# Roles which require a uKids leader
-REQUIRES_LEADER = {"helping ninja and check in leader"}  # normalized
+# Special gates (normalized names) — keep if you need a leader badge for certain roles
+REQUIRES_LEADER = {"helping ninja and check in leader"}
 
-# Strict per-Sunday preferred-fill order
+# Strict per-Sunday preferred-fill for rescue
 PREFERRED_FILL_ORDER = [
     "age 9 leader",
     "age 9 classroom",
@@ -92,7 +93,10 @@ CAP_PATTERNS = [
 ]
 
 def parse_role_meta(header: str):
-    """Return (base_label, capacity:int, is_starred:bool). Accepts 'Role* x3', 'Role (x3)', 'Role*' etc."""
+    """
+    From a Positions header return (base_label, capacity:int, is_starred:bool).
+    Accepts variations: 'Role* (x3)', 'Role (x3)', 'Role* x3', 'Role x3', 'Role*'.
+    """
     s = sanitize_header_text(header)
     base = s
     cap = 1
@@ -167,13 +171,23 @@ def detect_name_column(df: pd.DataFrame, fallback_first: bool = True) -> str:
     raise ValueError("Could not detect a 'name' column.")
 
 def is_priority_col(series: pd.Series) -> bool:
-    vals = pd.to_numeric(series, errors="coerce").dropna()
-    if len(vals) == 0:
+    """
+    Determine if a column is a priority column even if cells contain things like '2#'.
+    We extract first integer from each non-empty cell and test range 0..5.
+    """
+    vals = []
+    for v in series.dropna():
+        s = str(v).strip()
+        m = re.search(r"\d+", s)
+        if m:
+            n = int(m.group(0))
+            vals.append(n)
+    if not vals:
         return False
-    return (vals.min() >= 0) and (vals.max() <= 5)
+    return (min(vals) >= 0) and (max(vals) <= 5)
 
 def parse_month_and_dates_from_headers(responses_df: pd.DataFrame):
-    # Accept "Are you available ..." OR shorthand like "05-Oct"
+    # Accept "Are you available ..." OR "05-Oct" / "5 Oct" / "5-October"
     avail_cols = [c for c in responses_df.columns if isinstance(c, str) and c.strip().lower().startswith("are you available")]
     if not avail_cols:
         avail_cols = [
@@ -220,6 +234,7 @@ def parse_month_and_dates_from_headers(responses_df: pd.DataFrame):
 # ──────────────────────────────────────────────────────────────────────────────
 # Data shaping
 # ──────────────────────────────────────────────────────────────────────────────
+
 def build_display_name_map(positions_df: pd.DataFrame, name_col: str):
     disp = {}
     for _, r in positions_df.iterrows():
@@ -228,11 +243,13 @@ def build_display_name_map(positions_df: pd.DataFrame, name_col: str):
             disp.setdefault(norm_name(raw), raw)
     return disp
 
+
 def build_long_df(people_df: pd.DataFrame, name_col: str, role_cols, codes_col: str = None):
     """
     Returns:
       - long_df rows: {person (norm), role (header as-is), priority:int}
-      - role_codes flags per person: has_D/BL/PL/EL/SL, raw
+      - role_codes per person:
+          raw, has_BL/PL/EL/SL flags (kept if you still use leader gates), extra_roles_norm=set of normalized base roles where the cell had a '#'
     """
     records = []
     role_codes = {}
@@ -242,30 +259,36 @@ def build_long_df(people_df: pd.DataFrame, name_col: str, role_cols, codes_col: 
             continue
         person = norm_name(display_name)
 
-        flags = {"has_D": False, "has_BL": False, "has_PL": False, "has_EL": False, "has_SL": False, "raw": ""}
+        flags = {"raw": "", "has_BL": False, "has_PL": False, "has_EL": False, "has_SL": False, "extra_roles_norm": set()}
         if codes_col and codes_col in people_df.columns:
             raw = str(r.get(codes_col, "") or "")
             flags["raw"] = raw
             toks = re.findall(r"[A-Za-z]+", raw.upper())
             for t in toks:
-                if t == "D": flags["has_D"] = True
-                elif t == "BL": flags["has_BL"] = True
+                if t == "BL": flags["has_BL"] = True
                 elif t == "PL": flags["has_PL"] = True
                 elif t == "EL": flags["has_EL"] = True
                 elif t == "SL": flags["has_SL"] = True
-        role_codes[person] = flags
 
         for role_hdr in role_cols:
-            pr = pd.to_numeric(r[role_hdr], errors="coerce")
-            if pd.isna(pr):
+            cell_raw = r.get(role_hdr, "")
+            cell = "" if pd.isna(cell_raw) else str(cell_raw).strip()
+            if cell == "":
                 continue
-            pr = int(round(pr))
+            has_hash = "#" in cell
+            m = re.search(r"\d+", cell)
+            if not m:
+                continue
+            pr = int(m.group(0))
             if pr >= 1:
-                if flags["has_D"] and pr != 1:
-                    continue
                 records.append({"person": person, "role": role_hdr, "priority": pr})
+                if has_hash:
+                    flags["extra_roles_norm"].add(normalize(strip_capacity_tag(role_hdr)))
+
+        role_codes[person] = flags
 
     return pd.DataFrame(records), role_codes
+
 
 def dedupe_latest_by_key(df: pd.DataFrame, key_series: pd.Series) -> pd.DataFrame:
     key_norm = key_series.map(norm_name)
@@ -276,6 +299,7 @@ def dedupe_latest_by_key(df: pd.DataFrame, key_series: pd.Series) -> pd.DataFram
         latest = df2.groupby("_key", as_index=False).tail(1).drop(columns=["_ts"])
         return latest
     return df2.groupby("_key", as_index=False).tail(1)
+
 
 def parse_availability(responses_df: pd.DataFrame, name_col_resp: str, date_map):
     responses_latest = dedupe_latest_by_key(responses_df, responses_df[name_col_resp])
@@ -303,8 +327,8 @@ def parse_availability(responses_df: pd.DataFrame, name_col_resp: str, date_map)
     service_dates = sorted(set(date_map.values()))
     return availability, service_dates, few_yes, display_from_responses
 
+
 def build_slot_plan_dynamic(all_role_headers):
-    """Return (slot_plan {base_role: capacity}, starred_norm_set) based on Positions headers."""
     slot_plan = {}
     starred_norm = set()
     excluded_norm = {normalize(x) for x in EXCLUDED_ROLES}
@@ -317,8 +341,8 @@ def build_slot_plan_dynamic(all_role_headers):
             starred_norm.add(normalize(base_label))
     return slot_plan, starred_norm
 
+
 def expand_roles_to_slots(slot_plan):
-    """Expand capacity into row names: 'Info' x4 → 'Info #1'..'#4'."""
     slot_rows = []
     slot_index = {}
     for role, n in slot_plan.items():
@@ -335,11 +359,13 @@ def expand_roles_to_slots(slot_plan):
                 slot_index[lab] = role
     return slot_rows, slot_index
 
+
 def build_eligibility(long_df: pd.DataFrame):
     elig = defaultdict(set)
     for _, r in long_df.iterrows():
         elig[str(r["person"]).strip()].add(str(r["role"]).strip())
     return elig
+
 
 def build_priority_lookup(long_df: pd.DataFrame):
     lut = {}
@@ -348,11 +374,16 @@ def build_priority_lookup(long_df: pd.DataFrame):
         lut[(str(r["person"]).strip(), normalize(base))] = int(r["priority"])
     return lut
 
-def is_ukids_leader(flags: dict) -> bool:
-    return bool(flags.get("has_BL") or flags.get("has_PL") or flags.get("has_EL") or flags.get("has_SL") or flags.get("has_D"))
 
-def base_max_for_person(flags: dict) -> int:
-    return 1 if flags.get("has_D", False) else 2
+def is_ukids_leader(flags: dict) -> bool:
+    # Keep this if certain roles require a leader; otherwise return True to disable gate entirely
+    return bool(flags.get("has_BL") or flags.get("has_PL") or flags.get("has_EL") or flags.get("has_SL"))
+
+
+def base_cap_for_person(flags: dict) -> int:
+    # Everyone has the same base monthly cap now.
+    return 2
+
 
 def role_allowed_for_person(eligibility, person_norm, base_role):
     nb = normalize(strip_capacity_tag(base_role))
@@ -361,16 +392,19 @@ def role_allowed_for_person(eligibility, person_norm, base_role):
             return True
     return False
 
+
 def pref_sort_key(pref_val):
-    # Prefer 2 > 3 > 4 > 1 (since P1 handled separately)
+    # Prefer 2 > 3 > 4 > 1 (P1 handled separately)
     if pref_val == 2: return 0
     if pref_val == 3: return 1
     if pref_val == 4: return 2
     if pref_val == 1: return 3
     return 9
 
+
 def get_priority_for(lookup, person_norm, role_name):
     return lookup.get((person_norm, normalize(strip_capacity_tag(role_name))))
+
 
 def compute_p1_roles_by_person(long_df, allowed_roles_set):
     p1 = defaultdict(set)
@@ -383,6 +417,7 @@ def compute_p1_roles_by_person(long_df, allowed_roles_set):
             p1[str(r["person"]).strip()].add(base)
     return p1
 
+
 def served_in_priority_one(schedule_cells, p1_roles_by_person, slot_to_role):
     served = set()
     for (row_name, _d), names in schedule_cells.items():
@@ -392,6 +427,7 @@ def served_in_priority_one(schedule_cells, p1_roles_by_person, slot_to_role):
                 served.add(nm_norm)
     return served
 
+
 def recompute_assign_counts(schedule_cells):
     cnt = Counter()
     for (_row, _d), names in schedule_cells.items():
@@ -400,6 +436,7 @@ def recompute_assign_counts(schedule_cells):
     return cnt
 
 # ─────────────── Brooklyn exclusions (generalized) ───────────────
+
 def parse_brooklyn_exclusions(excl_df: pd.DataFrame, positions_headers):
     """
     Treat ANY listed name as excluded from ALL Brooklyn roles this month.
@@ -430,7 +467,7 @@ def parse_brooklyn_exclusions(excl_df: pd.DataFrame, positions_headers):
     summary = f"Exclusions loaded: {len(excluded_names)} people blocked from ALL Brooklyn roles."
     return is_excluded, summary, excluded_names
 
-# Brooklyn: prefer P1 and swap out of Brooklyn if an excluded person was placed there
+
 def brooklyn_exclusion_prefer_p1_and_swap(schedule_cells, slot_rows, slot_to_role, service_dates,
                                           availability, role_codes, eligibility, is_excluded,
                                           p1_roles_by_person, people, requires_leader_norm):
@@ -439,7 +476,7 @@ def brooklyn_exclusion_prefer_p1_and_swap(schedule_cells, slot_rows, slot_to_rol
       - If the assigned person is excluded from Brooklyn, try to:
         A) SWAP them with someone sitting in one of THEIR OWN P1 roles that same day (if the other person can do Brooklyn).
         B) MOVE them into an empty P1 slot that day and backfill Brooklyn with a free eligible candidate.
-      - Assignment counts are NOT updated here; they will be recomputed after this pass.
+      - Counts are recomputed after this pass.
     """
     def nb(s): return normalize(strip_capacity_tag(s))
 
@@ -456,7 +493,6 @@ def brooklyn_exclusion_prefer_p1_and_swap(schedule_cells, slot_rows, slot_to_rol
         return any(person in names for (rn, dd), names in schedule_cells.items() if dd == d)
 
     def find_free_candidate_for(base_role, d, forbidden=set()):
-        # Any available, eligible, NOT assigned that day
         pool = []
         for q in people:
             if q in forbidden:
@@ -468,7 +504,7 @@ def brooklyn_exclusion_prefer_p1_and_swap(schedule_cells, slot_rows, slot_to_rol
             pool.append(q)
         if not pool:
             return None
-        pool.sort()  # stable tie-break
+        pool.sort()
         return pool[0]
 
     for d in service_dates:
@@ -478,11 +514,11 @@ def brooklyn_exclusion_prefer_p1_and_swap(schedule_cells, slot_rows, slot_to_rol
                 continue
             p = schedule_cells[(row, d)][0]
             if not is_excluded(p, slot_to_role[row]):
-                continue  # fine
+                continue
 
             p1_set = p1_roles_by_person.get(p, set())
 
-            # A) Try swapping with someone who occupies one of p's P1 slots
+            # A) Swap into their P1
             swapped = False
             for r2 in slot_rows:
                 base2 = slot_to_role[r2]
@@ -491,12 +527,10 @@ def brooklyn_exclusion_prefer_p1_and_swap(schedule_cells, slot_rows, slot_to_rol
                 if len(schedule_cells[(r2, d)]) == 0:
                     continue
                 q = schedule_cells[(r2, d)][0]
-                # q must be allowed & available for Brooklyn; p must be allowed & available for base2
                 if not eligible_and_available(q, slot_to_role[row], d):
                     continue
                 if not eligible_and_available(p, base2, d):
                     continue
-                # swap occupants
                 schedule_cells[(row, d)][0] = q
                 schedule_cells[(r2, d)][0] = p
                 swapped = True
@@ -504,7 +538,7 @@ def brooklyn_exclusion_prefer_p1_and_swap(schedule_cells, slot_rows, slot_to_rol
             if swapped:
                 continue
 
-            # B) Try moving p into an empty P1 slot and backfill Brooklyn with a free candidate
+            # B) Move into empty P1 + backfill Brooklyn
             empty_p1_rows = [r2 for r2 in slot_rows if (slot_to_role[r2] in p1_set) and len(schedule_cells[(r2, d)]) == 0]
             moved = False
             for r2 in empty_p1_rows:
@@ -513,37 +547,52 @@ def brooklyn_exclusion_prefer_p1_and_swap(schedule_cells, slot_rows, slot_to_rol
                     continue
                 replacement = find_free_candidate_for(slot_to_role[row], d, forbidden={p})
                 if replacement and not is_excluded(replacement, slot_to_role[row]):
-                    schedule_cells[(r2, d)].append(p)     # p goes to P1 empty
-                    schedule_cells[(row, d)][0] = replacement  # replacement to Brooklyn
+                    schedule_cells[(r2, d)].append(p)
+                    schedule_cells[(row, d)][0] = replacement
                     moved = True
                     break
-            # if neither swap nor move worked, leave as-is; later passes may still adjust, but p is blocked in general fill anyway.
+
+# ─────────────── Per-role '#' helper ───────────────
+
+def within_role_specific_cap(person, target_base_role, flags, assign_count):
+    """
+    Base caps: everyone=2.
+    Allow at most +1 total beyond base — but only if this extra assignment
+    is INTO a role marked with '#' for this person (extra_roles_norm).
+    """
+    base_cap = base_cap_for_person(flags)
+    tot = assign_count.get(person, 0)
+    if tot < base_cap:
+        return True
+    nb = normalize(strip_capacity_tag(target_base_role))
+    return (tot < base_cap + 1) and (nb in flags.get("extra_roles_norm", set()))
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Scheduling core
 # ──────────────────────────────────────────────────────────────────────────────
+
 def main_pass_schedule(long_df, availability, service_dates, role_codes, all_role_headers, exclusions_tuple):
     """
     Returns schedule_cells, assign_count, slot_rows, slot_to_role, eligibility, people, p1_roles_by_person
     """
     is_excluded, _excl_summary, excluded_names_set = exclusions_tuple
 
-    # slots
+    # Build slots and starred set
     slot_plan, starred_norm_set = build_slot_plan_dynamic(all_role_headers)
     slot_rows, slot_to_role = expand_roles_to_slots(slot_plan)
 
-    # eligibility & priorities
+    # Eligibility & priorities
     eligibility = build_eligibility(long_df)
     priority_lut = build_priority_lookup(long_df)
 
-    # in both sources
+    # Only people present in BOTH sources
     people = sorted(set(eligibility.keys()) & set(availability.keys()))
 
-    # storage
+    # Storage
     schedule_cells = {(slot, d): [] for slot in slot_rows for d in service_dates}
     assign_count = defaultdict(int)
 
-    # preferred ordering
+    # Sort slots so preferred-fill comes first
     def slot_sort_key(s):
         base_role = slot_to_role[s]
         n = normalize(base_role)
@@ -569,9 +618,6 @@ def main_pass_schedule(long_df, availability, service_dates, role_codes, all_rol
 
     for p in p1_people_order:
         flags = role_codes.get(p, {})
-        cap = base_max_for_person(flags)
-        if assign_count[p] >= cap:
-            continue
         got_one = False
         for d in service_dates:
             if not availability.get(p, {}).get(d, False):
@@ -590,6 +636,8 @@ def main_pass_schedule(long_df, availability, service_dates, role_codes, all_rol
                     continue
                 if normalize(base_role) in REQUIRES_LEADER and not is_ukids_leader(flags):
                     continue
+                if not within_role_specific_cap(p, base_role, flags, assign_count):
+                    continue
                 if len(schedule_cells[(slot_row, d)]) == 0:
                     schedule_cells[(slot_row, d)].append(p)
                     assign_count[p] += 1
@@ -598,7 +646,7 @@ def main_pass_schedule(long_df, availability, service_dates, role_codes, all_rol
             if got_one:
                 break
 
-    # General fill — respects Brooklyn exclusion
+    # General fill — respects Brooklyn exclusion and per-role '#'
     for d in service_dates:
         assigned_today = set(nm for (rn, dd), names in schedule_cells.items() if dd == d for nm in names)
         for slot_row in slot_rows_sorted:
@@ -609,29 +657,29 @@ def main_pass_schedule(long_df, availability, service_dates, role_codes, all_rol
             cands = []
             for p in people:
                 flags = role_codes.get(p, {})
-                if assign_count[p] >= base_max_for_person(flags):
-                    continue
                 if p in assigned_today:
                     continue
                 if not availability.get(p, {}).get(d, False):
                     continue
                 if is_excluded(p, base_role):
-                    continue  # block Brooklyn for excluded names
+                    continue
                 if not role_allowed_for_person(eligibility, p, base_role):
                     continue
                 if normalize(base_role) in REQUIRES_LEADER and not is_ukids_leader(flags):
+                    continue
+                if not within_role_specific_cap(p, base_role, flags, assign_count):
                     continue
                 pr = get_priority_for(priority_lut, p, base_role)
                 cands.append((p, pr))
 
             if cands:
-                cands.sort(key=lambda t: (assign_count[t[0]], pref_sort_key(t[1]), t[0]))
+                cands.sort(key=lambda t: (assign_count[t[0]], (pref_sort_key(t[1]) if t[1] is not None else 9), t[0]))
                 chosen = cands[0][0]
                 schedule_cells[(slot_row, d)].append(chosen)
                 assign_count[chosen] += 1
                 assigned_today.add(chosen)
 
-    # Swap/move pass: remove excluded names from any Brooklyn slots, prefer their own P1
+    # Brooklyn swap/move pass — ensure excluded people do not stay in Brooklyn
     brooklyn_exclusion_prefer_p1_and_swap(
         schedule_cells, slot_rows, slot_to_role, service_dates,
         availability, role_codes, eligibility, is_excluded,
@@ -641,7 +689,7 @@ def main_pass_schedule(long_df, availability, service_dates, role_codes, all_rol
     # Recompute counts after swaps
     assign_count = recompute_assign_counts(schedule_cells)
 
-    # Preferred roles rescue (Age 9/10/11) with free-candidate or swap-from-lower-priority
+    # Preferred roles rescue for Age 9→11
     def pref_rank(base_role):
         return PREFERRED_INDEX.get(normalize(base_role), 999)
 
@@ -649,8 +697,6 @@ def main_pass_schedule(long_df, availability, service_dates, role_codes, all_rol
         pool = []
         for p in people:
             flags = role_codes.get(p, {})
-            if assign_count[p] >= base_max_for_person(flags):
-                continue
             if p in assigned_today_set:
                 continue
             if not availability.get(p, {}).get(d, False):
@@ -661,24 +707,25 @@ def main_pass_schedule(long_df, availability, service_dates, role_codes, all_rol
                 continue
             if normalize(base_role) in REQUIRES_LEADER and not is_ukids_leader(flags):
                 continue
+            if not within_role_specific_cap(p, base_role, flags, assign_count):
+                continue
             pr = get_priority_for(priority_lut, p, base_role)
             pool.append((p, pr))
         if not pool:
             return None
-        pool.sort(key=lambda t: (pref_sort_key(t[1]), assign_count[t[0]], t[0]))
+        pool.sort(key=lambda t: ((pref_sort_key(t[1]) if t[1] is not None else 9), assign_count[t[0]], t[0]))
         return pool[0][0]
 
     for d in service_dates:
         assigned_today = {nm for (rn, dd), names in schedule_cells.items() if dd == d for nm in names}
-        # iterate the preferred order roles
+
         for pref_base in PREFERRED_FILL_ORDER:
-            # rows with that base
             target_rows = [row for row in slot_rows if normalize(slot_to_role[row]) == pref_base]
             for row in target_rows:
                 if len(schedule_cells[(row, d)]) >= 1:
                     continue
 
-                # try free candidate first
+                # 1) free candidate first
                 cand = find_free_candidate_for(slot_to_role[row], d, assigned_today)
                 if cand:
                     schedule_cells[(row, d)].append(cand)
@@ -686,7 +733,7 @@ def main_pass_schedule(long_df, availability, service_dates, role_codes, all_rol
                     assigned_today.add(cand)
                     continue
 
-                # swap from lower-priority row
+                # 2) swap from strictly lower-priority slot
                 donor_cells = []
                 for (r2, dd), names in schedule_cells.items():
                     if dd != d or not names:
@@ -697,11 +744,12 @@ def main_pass_schedule(long_df, availability, service_dates, role_codes, all_rol
 
                 moved = False
                 for r2, base2, person in donor_cells:
+                    flags = role_codes.get(person, {})
                     if is_excluded(person, slot_to_role[row]):
                         continue
                     if not role_allowed_for_person(eligibility, person, slot_to_role[row]):
                         continue
-                    if normalize(slot_to_role[row]) in REQUIRES_LEADER and not is_ukids_leader(role_codes.get(person, {})):
+                    if normalize(slot_to_role[row]) in REQUIRES_LEADER and not is_ukids_leader(flags):
                         continue
                     # find backfill for r2
                     temp_assigned = assigned_today - {person}
@@ -716,27 +764,26 @@ def main_pass_schedule(long_df, availability, service_dates, role_codes, all_rol
                     assigned_today.add(backfill)
                     moved = True
                     break
-                # if not moved, remains empty
+                # else leave empty
 
-    # Recompute counts before star overflow
+    # Recompute before star overflow
     assign_count = recompute_assign_counts(schedule_cells)
 
-    # Star overflow pass: +1 in starred roles only (after non-star cap reached)
-    _slot_plan_tmp, starred_norm_set = build_slot_plan_dynamic(all_role_headers)
+    # Star overflow pass — allow +1 (total) in STARRED roles only (after non-star cap)
+    slot_plan_tmp, starred_norm_set = build_slot_plan_dynamic(all_role_headers)
+
     for d in service_dates:
         assigned_today = {nm for (rn, dd), names in schedule_cells.items() if dd == d for nm in names}
 
-        # compute non-star counts
+        # Count non-star assignments so far (month-to-date)
         total = Counter()
         nonstar = Counter()
         for (row, dd), names in schedule_cells.items():
-            if dd != d:
-                continue
             base = slot_to_role[row]
-            star = normalize(base) in starred_norm_set
+            is_star = normalize(base) in starred_norm_set
             for nm in names:
                 total[nm] += 1
-                if not star:
+                if not is_star:
                     nonstar[nm] += 1
 
         starred_empty_rows = [
@@ -748,6 +795,7 @@ def main_pass_schedule(long_df, availability, service_dates, role_codes, all_rol
             base_role = slot_to_role[row]
             cands = []
             for p in people:
+                flags = role_codes.get(p, {})
                 if p in assigned_today:
                     continue
                 if not availability.get(p, {}).get(d, False):
@@ -756,20 +804,15 @@ def main_pass_schedule(long_df, availability, service_dates, role_codes, all_rol
                     continue
                 if not role_allowed_for_person(eligibility, p, base_role):
                     continue
-                if normalize(base_role) in REQUIRES_LEADER and not is_ukids_leader(role_codes.get(p, {})):
+                if normalize(base_role) in REQUIRES_LEADER and not is_ukids_leader(flags):
                     continue
 
-                flags = role_codes.get(p, {})
-                base_cap = base_max_for_person(flags)
-                tot = assign_count.get(p, 0)  # counts across month
-                non = 0
-                # recompute person's nonstar count across all dates quickly
-                for (rS, dS), namesS in schedule_cells.items():
-                    if p in namesS:
-                        if normalize(slot_to_role[rS]) not in starred_norm_set:
-                            non += 1
+                base_cap = base_cap_for_person(flags)
+                tot = total.get(p, 0)
+                non = nonstar.get(p, 0)
 
                 allow_normal = tot < base_cap
+                # Overflow only if they've hit base in non-star assignments and total < base+1
                 allow_overflow = (non >= base_cap) and (tot < base_cap + 1)
 
                 if allow_normal or allow_overflow:
@@ -777,7 +820,7 @@ def main_pass_schedule(long_df, availability, service_dates, role_codes, all_rol
                     cands.append((p, pr, tot))
 
             if cands:
-                cands.sort(key=lambda t: (t[2], pref_sort_key(t[1]), t[0]))
+                cands.sort(key=lambda t: (t[2], (pref_sort_key(t[1]) if t[1] is not None else 9), t[0]))
                 chosen = cands[0][0]
                 schedule_cells[(row, d)].append(chosen)
                 assign_count[chosen] = assign_count.get(chosen, 0) + 1
@@ -788,6 +831,7 @@ def main_pass_schedule(long_df, availability, service_dates, role_codes, all_rol
 # ──────────────────────────────────────────────────────────────────────────────
 # Output helpers
 # ──────────────────────────────────────────────────────────────────────────────
+
 def excel_autofit(ws):
     for col_idx, column_cells in enumerate(
         ws.iter_cols(min_row=1, max_row=ws.max_row, min_col=1, max_col=ws.max_column), start=1
@@ -798,6 +842,7 @@ def excel_autofit(ws):
             max_len = max(max_len, len(val))
         ws.column_dimensions[get_column_letter(col_idx)].width = min(max(12, max_len + 2), 80)
 
+
 def build_schedule_df(schedule_cells, slot_rows, service_dates, name_display_map):
     cols = [d.strftime("%Y-%m-%d") for d in service_dates]
     df = pd.DataFrame(index=slot_rows, columns=cols)
@@ -805,6 +850,7 @@ def build_schedule_df(schedule_cells, slot_rows, service_dates, name_display_map
         disp = [name_display_map.get(nm, nm) for nm in names]
         df.loc[slot_row, d.strftime("%Y-%m-%d")] = ", ".join(disp)
     return df.fillna("")
+
 
 def build_person_assignment_details(schedule_cells, name_display_map):
     per = defaultdict(list)
@@ -818,9 +864,38 @@ def build_person_assignment_details(schedule_cells, name_display_map):
         details[disp_name] = "; ".join([f"{dt.strftime('%Y-%m-%d')} — {slot}" for dt, slot in items_sorted])
     return details
 
+
+def build_unscheduled_available(schedule_cells, service_dates, availability, name_display_map):
+    """Return a DataFrame with one column per date, listing people who said YES but were not scheduled on that date."""
+    # who is scheduled on each date
+    scheduled_by_date = defaultdict(set)
+    for (slot_row, d), names in schedule_cells.items():
+        for nm in names:
+            scheduled_by_date[d].add(nm)
+
+    # build rows as names (display order A→Z), columns as dates
+    cols = [d.strftime("%Y-%m-%d") for d in service_dates]
+
+    # collect list for each date
+    lists_per_date = {}
+    for d in service_dates:
+        yes_people = [p for p in availability.keys() if availability.get(p, {}).get(d, False)]
+        unscheduled = sorted([name_display_map.get(p, p) for p in yes_people if p not in scheduled_by_date.get(d, set())])
+        lists_per_date[d] = unscheduled
+
+    # create a ragged table by padding shorter lists with empty strings
+    max_len = max((len(v) for v in lists_per_date.values()), default=0)
+    data = {
+        d.strftime("%Y-%m-%d"): (lists_per_date[d] + [""] * (max_len - len(lists_per_date[d])))
+        for d in service_dates
+    }
+    df = pd.DataFrame(data)
+    return df
+
 # ──────────────────────────────────────────────────────────────────────────────
 # UI
 # ──────────────────────────────────────────────────────────────────────────────
+
 st.subheader("1) Upload files")
 c1, c2, c3 = st.columns(3)
 with c1:
@@ -830,10 +905,11 @@ with c2:
 with c3:
     exclusions_file = st.file_uploader("Last month Brooklyn exclusions (CSV/XLSX)", type=["csv", "xlsx", "xls"], key="exclusions_csv_any")
 
-st.caption("• Positions CSV: first col = volunteer names; second col = role codes (e.g., D/BL/PL/EL/SL); other cols = roles with values 0–5 (0 = not allowed, 1 = must serve once).")
-st.caption("• For multi-slot roles, add capacity in the header: 'Info (x4)', 'Poef Toets x3', or 'Brooklyn preschool [x4]'. Add '*' to mark starred roles, e.g., 'Info* (x4)'.")
-st.caption("• Responses CSV: has a name column + availability columns like '05-Oct' or 'Are you available 7 September?' and a Timestamp column.")
-st.caption("• Exclusions (optional): List of names who served in Brooklyn last month. They are blocked from ALL Brooklyn roles and are prioritized for a P1 slot.")
+st.caption("• Positions CSV: first col = volunteer names; second col = optional role codes (BL/PL/EL/SL). Other cols = roles with values 0–5.")
+st.caption("• To give someone +1 extra assignment but ONLY for a specific role, put a '#' in that cell, e.g. '2#'.")
+st.caption("• For capacity add '(xN)' / 'xN' / '[xN]' to headers. Add '*' at end to mark starred roles (eligible for +1 overflow after base cap).")
+st.caption("• Responses CSV: has a name column + availability columns like '05-Oct' or 'Are you available 7 September?' and a Timestamp.")
+st.caption("• Exclusions (optional): List of names who served in Brooklyn last month. They’re blocked from all Brooklyn roles and get P1 priority.")
 
 if st.button("Generate Schedule", type="primary"):
     if not positions_file or not responses_file:
@@ -846,7 +922,7 @@ if st.button("Generate Schedule", type="primary"):
     if exclusions_file is not None:
         excl_df = read_table_any(exclusions_file, "exclusions")
 
-    # Detect names
+    # Detect name columns
     try:
         name_col_positions = positions_df.columns[0]
     except Exception as e:
@@ -865,7 +941,7 @@ if st.button("Generate Schedule", type="primary"):
     # Display name map (prefer Positions casing)
     name_display_map = build_display_name_map(positions_df, name_col_positions)
 
-    # Roles from 3rd column onward
+    # Roles from 3rd column onward (accept '2#' etc.)
     raw_role_cols = [c for c in positions_df.columns[2:] if is_priority_col(positions_df[c])]
     excluded_norm = {normalize(x) for x in EXCLUDED_ROLES}
     role_cols = [c for c in raw_role_cols if normalize(strip_capacity_tag(c)) not in excluded_norm]
@@ -873,13 +949,13 @@ if st.button("Generate Schedule", type="primary"):
         st.error("No usable role columns detected in Positions CSV (from the third column onwards).")
         st.stop()
 
-    # Brooklyn exclusions checker & set
+    # Brooklyn exclusions checker
     is_excluded, excl_summary, brooklyn_excluded_names = parse_brooklyn_exclusions(excl_df, positions_headers=role_cols)
 
     # Eligibility & codes
     long_df, role_codes = build_long_df(positions_df, name_col_positions, role_cols, codes_col=codes_col)
     if long_df.empty:
-        st.error("No eligible assignments found (after Director rule and removing 0s).")
+        st.error("No eligible assignments found (after removing 0s).")
         st.stop()
 
     # Dates
@@ -900,7 +976,7 @@ if st.button("Generate Schedule", type="primary"):
         exclusions_tuple=(is_excluded, excl_summary, brooklyn_excluded_names)
     )
 
-    # DataFrames
+    # Tables
     schedule_df = build_schedule_df(schedule_cells, slot_rows, service_dates, name_display_map)
 
     total_slots = schedule_df.size
@@ -908,6 +984,7 @@ if st.button("Generate Schedule", type="primary"):
     fill_rate = (filled_slots / total_slots) if total_slots else 0.0
     unfilled = total_slots - filled_slots
 
+    # Per-person summary + details
     per_series = pd.Series(assign_count_norm, name="Assignments")
     per_series.index = [name_display_map.get(k, k) for k in per_series.index]
     per_person = (
@@ -924,6 +1001,9 @@ if st.button("Generate Schedule", type="primary"):
     p1_people_norm = sorted([p for p in people_norm if p1_roles_by_person.get(p)])
     unmet_p1_norm = [p for p in p1_people_norm if p not in served_p1_people_norm]
     unmet_p1_display = [name_display_map.get(k, k) for k in unmet_p1_norm]
+
+    # NEW: Unscheduled but Available list per date
+    unscheduled_df = build_unscheduled_available(schedule_cells, service_dates, availability, name_display_map)
 
     st.success(f"Schedule generated for **{sheet_name}**")
     st.write(f"Filled slots: **{filled_slots} / {total_slots}**  (Fill rate: **{fill_rate:.1%}**)  •  Unfilled: **{unfilled}**")
@@ -943,6 +1023,10 @@ if st.button("Generate Schedule", type="primary"):
         st.subheader("Unmet Priority-1 (info)")
         st.caption("These volunteers have at least one Priority-1 location but weren’t scheduled into any Priority-1 slot (capacity/availability constraints).")
         st.dataframe(pd.DataFrame({"Person": unmet_p1_display}), use_container_width=True)
+
+    st.subheader("Unscheduled but Available — by Date")
+    st.caption("Shows everyone who said YES on that date but was not placed anywhere that day.")
+    st.dataframe(unscheduled_df, use_container_width=True)
 
     # Excel export
     wb = Workbook()
@@ -978,6 +1062,15 @@ if st.button("Generate Schedule", type="primary"):
         for p in unmet_p1_display:
             ws4.append([p])
         excel_autofit(ws4)
+
+    # NEW: add Unscheduled sheet
+    ws5 = wb.create_sheet("Unscheduled by Date")
+    ws5.append([" "] + [d.strftime("%Y-%m-%d") for d in service_dates])
+    # write as rows (ragged lists already padded)
+    for i in range(unscheduled_df.shape[0]):
+        row_vals = [i+1] + [unscheduled_df.iloc[i, j] for j in range(unscheduled_df.shape[1])]
+        ws5.append(row_vals)
+    excel_autofit(ws5)
 
     buf = io.BytesIO()
     wb.save(buf)
