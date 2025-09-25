@@ -4,6 +4,7 @@
 # NOTE: All Director-specific rules have been removed. Everyone has the same base cap.
 # NEW: Adds an output that lists, per date, people who said YES but were not scheduled that day — with a second column
 #      showing each person's role code (e.g., PSG, BSG). Also exported to Excel as paired columns per date.
+# NEW (Sept 2025): Unscheduled table is sorted by campus (Pretoria, Nelspruit[ Nel ], Polokwane[ POL ], Tygerberg[ TGB ]) based on codes column.
 
 import io
 import re
@@ -91,6 +92,9 @@ KNOWN_CODES_ORDER = [
     "D",                         # director (no special rules)
 ]
 
+# Campus parsing (from codes column)
+CAMPUS_ORDER = ["pretoria", "nelspruit", "polokwane", "tygerberg"]
+CAMPUS_LABELS = {"pretoria": "Pretoria", "nelspruit": "Nelspruit", "polokwane": "Polokwane", "tygerberg": "Tygerberg"}
 
 def normalize(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", str(s).lower()).strip()
@@ -286,6 +290,33 @@ def build_person_code_map(positions_df: pd.DataFrame, name_col: str, codes_col: 
                 continue
             code_map[nm] = extract_primary_code(r.get(codes_col, ""))
     return code_map
+
+
+def build_person_campus_map(positions_df: pd.DataFrame, name_col: str, codes_col: str | None):
+    """
+    Detect campus from codes column tokens:
+    - If contains 'NEL' => Nelspruit
+    - If contains 'POL' => Polokwane
+    - If contains 'TGB' => Tygerberg
+    - Else => Pretoria
+    """
+    camp_map = {}
+    if codes_col and codes_col in positions_df.columns:
+        for _, r in positions_df.iterrows():
+            nm = norm_name(str(r[name_col]).strip())
+            if not nm:
+                continue
+            raw = str(r.get(codes_col, "") or "").upper()
+            tokens = re.findall(r"[A-Z]+", raw)
+            campus = "pretoria"
+            if any(t == "NEL" for t in tokens):
+                campus = "nelspruit"
+            elif any(t == "POL" for t in tokens):
+                campus = "polokwane"
+            elif any(t == "TGB" for t in tokens):
+                campus = "tygerberg"
+            camp_map[nm] = campus
+    return camp_map
 
 
 def build_long_df(people_df: pd.DataFrame, name_col: str, role_cols, codes_col: str = None):
@@ -708,6 +739,7 @@ def main_pass_schedule(long_df, availability, service_dates, role_codes, all_rol
                 chosen = cands[0][0]
                 schedule_cells[(slot_row, d)].append(chosen)
                 assign_count[chosen] += 1
+                assigned_today.add(chosen)   # keep same-day unique
 
     # Brooklyn swap/move pass — ensure excluded people do not stay in Brooklyn
     brooklyn_exclusion_prefer_p1_and_swap(
@@ -843,6 +875,7 @@ def main_pass_schedule(long_df, availability, service_dates, role_codes, all_rol
                 chosen = cands[0][0]
                 schedule_cells[(row, d)].append(chosen)
                 assign_count[chosen] = assign_count.get(chosen, 0) + 1
+                assigned_today.add(chosen)   # keep same-day unique in overflow
 
     return schedule_cells, assign_count, slot_rows, slot_to_role, eligibility, people, p1_roles_by_person
 
@@ -883,29 +916,44 @@ def build_person_assignment_details(schedule_cells, name_display_map):
     return details
 
 
-def build_unscheduled_available(schedule_cells, service_dates, availability, name_display_map, code_map):
-    """Return a DataFrame with two columns per date: Name and Code for everyone
+def build_unscheduled_available(schedule_cells, service_dates, availability, name_display_map, code_map, campus_map):
+    """
+    Return a DataFrame with two columns per date: Name and Code for everyone
     who said YES on that date but was not scheduled anywhere that day.
+    Sorted by campus (Pretoria, Nelspruit, Polokwane, Tygerberg), then by name.
     """
     scheduled_by_date = defaultdict(set)
     for (slot_row, d), names in schedule_cells.items():
         for nm in names:
             scheduled_by_date[d].add(nm)
 
-    # collect lists per date
+    def campus_key(person_norm):
+        c = campus_map.get(person_norm, "pretoria")
+        # Map to index for stable ordering
+        try:
+            idx = CAMPUS_ORDER.index(c)
+        except ValueError:
+            idx = 0
+        return idx
+
     per_date_names = {}
     per_date_codes = {}
     for d in service_dates:
         yes_people = [p for p in availability.keys() if availability.get(p, {}).get(d, False)]
         unscheduled = [p for p in yes_people if p not in scheduled_by_date.get(d, set())]
-        # sort by display name
-        unsorted_pairs = [
-            (name_display_map.get(p, p), code_map.get(p, ""))
-            for p in unscheduled
-        ]
-        unsorted_pairs.sort(key=lambda x: (x[0] or ""))
-        per_date_names[d] = [nm for nm, _ in unsorted_pairs]
-        per_date_codes[d] = [cd for _, cd in unsorted_pairs]
+
+        # Compose tuples for sorting: (campusIndex, displayName, code, person_norm)
+        tuples = []
+        for p in unscheduled:
+            disp = name_display_map.get(p, p)
+            code = code_map.get(p, "")
+            ck = campus_key(p)
+            tuples.append((ck, disp or "", code, p))
+
+        tuples.sort(key=lambda t: (t[0], t[1]))  # by campus then name
+
+        per_date_names[d] = [t[1] for t in tuples]
+        per_date_codes[d] = [t[2] for t in tuples]
 
     # pad ragged lists
     max_len = max((len(v) for v in per_date_names.values()), default=0)
@@ -933,12 +981,13 @@ with c2:
 with c3:
     exclusions_file = st.file_uploader("Last month Brooklyn exclusions (CSV/XLSX)", type=["csv", "xlsx", "xls"], key="exclusions_csv_any")
 
-st.caption("• Positions CSV: first col = volunteer names; second col = optional role codes (BL/PL/EL/SL/BSG/PSG/ESG/DSG). Other cols = roles with values 0–5.")
+st.caption("• Positions CSV: first col = volunteer names; second col = optional role codes (BL/PL/EL/SL/BSG/PSG/ESG/DSG + campus tags like NEL/POL/TGB). Other cols = roles with values 0–5.")
 st.caption("• To give someone +1 extra assignment but ONLY for a specific role, put a '#' in that cell, e.g. '2#'.")
 st.caption("• For capacity add '(xN)' / 'xN' / '[xN]' to headers. Add '*' at end to mark starred roles (eligible for +1 overflow after base cap).")
 st.caption("• Responses CSV: has a name column + availability columns like '05-Oct' or 'Are you available 7 September?' and a Timestamp.")
 st.caption("• Exclusions (optional): List of names who served in Brooklyn last month. They’re blocked from all Brooklyn roles and get P1 priority.")
 st.caption("• Priority rescue order: Age 1→11 Leaders, then Brooklyn Babies Leader, then Brooklyn Preschool Leader.")
+st.caption("• Unscheduled sorting: Pretoria → Nelspruit (Nel) → Polokwane (POL) → Tygerberg (TGB). Detected from the codes column tokens NEL/POL/TGB.")
 
 if st.button("Generate Schedule", type="primary"):
     if not positions_file or not responses_file:
@@ -970,8 +1019,9 @@ if st.button("Generate Schedule", type="primary"):
     # Display name map (prefer Positions casing)
     name_display_map = build_display_name_map(positions_df, name_col_positions)
 
-    # Code map for the new two-column unscheduled table
+    # Code map + Campus map for the unscheduled table
     code_map = build_person_code_map(positions_df, name_col_positions, codes_col)
+    campus_map = build_person_campus_map(positions_df, name_col_positions, codes_col)
 
     # Roles from 3rd column onward (accept '2#' etc.)
     raw_role_cols = [c for c in positions_df.columns[2:] if is_priority_col(positions_df[c])]
@@ -1034,8 +1084,10 @@ if st.button("Generate Schedule", type="primary"):
     unmet_p1_norm = [p for p in p1_people_norm if p not in served_p1_people_norm]
     unmet_p1_display = [name_display_map.get(k, k) for k in unmet_p1_norm]
 
-    # NEW: Unscheduled but Available list per date (two columns per date: Name + Code)
-    unscheduled_df = build_unscheduled_available(schedule_cells, service_dates, availability, name_display_map, code_map)
+    # UPDATED: Unscheduled but Available list per date — sorted by campus order (then name)
+    unscheduled_df = build_unscheduled_available(
+        schedule_cells, service_dates, availability, name_display_map, code_map, campus_map
+    )
 
     st.success(f"Schedule generated for **{sheet_name}**")
     st.write(f"Filled slots: **{filled_slots} / {total_slots}**  (Fill rate: **{fill_rate:.1%}**)  •  Unfilled: **{unfilled}**")
@@ -1057,7 +1109,7 @@ if st.button("Generate Schedule", type="primary"):
         st.dataframe(pd.DataFrame({"Person": unmet_p1_display}), use_container_width=True)
 
     st.subheader("Unscheduled but Available — by Date (Name + Code)")
-    st.caption("Shows everyone who said YES on that date but was not placed anywhere that day, plus their short role code.")
+    st.caption("Sorted by campus: Pretoria → Nelspruit (Nel) → Polokwane (POL) → Tygerberg (TGB). Campus is inferred from the codes column (NEL/POL/TGB).")
     st.dataframe(unscheduled_df, use_container_width=True)
 
     # Excel export
@@ -1095,7 +1147,7 @@ if st.button("Generate Schedule", type="primary"):
             ws4.append([p])
         excel_autofit(ws4)
 
-    # NEW: add Unscheduled sheet with paired columns (Date, Date code)
+    # Unscheduled by Date (sorted by campus)
     ws5 = wb.create_sheet("Unscheduled by Date")
     header_pairs = []
     for d in service_dates:
@@ -1104,7 +1156,7 @@ if st.button("Generate Schedule", type="primary"):
     ws5.append([" "] + header_pairs)
 
     for i in range(unscheduled_df.shape[0]):
-        row_vals = [i+1] + [unscheduled_df.iloc[i, j] for j in range(unscheduled_df.shape[1])]
+        row_vals = [i + 1] + [unscheduled_df.iloc[i, j] for j in range(unscheduled_df.shape[1])]
         ws5.append(row_vals)
     excel_autofit(ws5)
 
