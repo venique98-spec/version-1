@@ -1,36 +1,40 @@
 # ukids_scheduler_app.py
-# uKids Scheduler — Google Sheets version
+# uKids Scheduler — Google Sheets CSV-link version
 #
-# Sources now used:
-# - Responses tab: availability answers and date columns.
+# IMPORTANT FIX:
+# - This version does NOT import gspread.
+# - It reads Google Sheets tabs through Google's CSV export link using only pandas.
+# - Your Google Sheet must be accessible to the deployed app by link.
+#   In Google Sheets: Share → General access → Anyone with the link → Viewer.
+#
+# Data sources:
+# - Responses tab: availability answers and service date columns.
 # - ServingBase tab: serving girls, campus, group, and priority codes.
-# - Mapping sheet tab: code meanings and required role quantities per campus.
+# - Mapping sheet tab: code meanings and required quantities per campus.
 #
-# Key rules:
-# - No Positions CSV input anymore.
+# Rules:
 # - Directors / director codes are ignored for now.
 # - People are scheduled separately by campus.
-# - Brooklyn roles may be filled by UC people only if their own priority codes include that Brooklyn role code.
-# - Group A/B leader rotation is blocked, not just preferred.
-# - Every serving girl is first attempted into one first-priority role per month, where possible.
+# - Brooklyn roles may be filled by UC people only if their own priority codes contain that Brooklyn role code.
+# - Group A/B leader rotation is blocked.
+# - Every serving girl is first attempted into one first-priority role per month where possible.
 # - No person is scheduled twice on the same date.
-# - Monthly cap applies, with no extra-cap system in this version.
+# - Monthly cap applies.
 
 import io
 import re
 import base64
+from urllib.parse import quote
 from collections import defaultdict, Counter
 from datetime import datetime, date
 
 import pandas as pd
 import streamlit as st
-import gspread
-from google.oauth2.service_account import Credentials
 from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Streamlit chrome
+# Page setup
 # ──────────────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="uKids Scheduler", layout="wide")
 st.title("uKids Scheduler")
@@ -76,7 +80,6 @@ MONTH_ALIASES = {
     "nov": 11, "november": 11,
     "dec": 12, "december": 12,
 }
-
 YES_SET = {"yes", "y", "true", "available"}
 NO_SET = {"no", "n", "false", "not available"}
 
@@ -88,22 +91,18 @@ CAMPUS_LABELS = {
     "NEL": "Nelspruit",
     "POL": "Polokwane",
 }
-
 DIRECTOR_CODES = {"DIR", "D", "ND", "PD", "TD"}
 ADMIN_VALUES = {"", "N/A", "NA", "NONE", "NAN", "-"}
-
 PRIORITY_COLS = [
     "1A", "1B", "1C", "1D", "1E",
     "2A", "2B", "2C", "2D", "2E",
     "3A", "3B", "3C", "3D", "3E",
-    "4A", "4B",
-    "5",
+    "4A", "4B", "5",
 ]
 
 # ──────────────────────────────────────────────────────────────────────────────
 # General helpers
 # ──────────────────────────────────────────────────────────────────────────────
-
 def normalize(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", str(s).lower()).strip()
 
@@ -130,7 +129,7 @@ def to_int_capacity(value) -> int:
     if pd.isna(value):
         return 0
     s = str(value).strip()
-    if s == "":
+    if not s:
         return 0
     try:
         return max(0, int(float(s)))
@@ -150,81 +149,41 @@ def excel_autofit(ws):
         ws.column_dimensions[get_column_letter(col_idx)].width = min(max(12, max_len + 2), 80)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Google Sheets helpers
+# Google Sheets via CSV export — no gspread needed
 # ──────────────────────────────────────────────────────────────────────────────
-
-def get_default_sheet_id_for_ui():
-    try:
-        return str(st.secrets.get("GOOGLE_SHEET_ID", ""))
-    except Exception:
-        return ""
-
-
-def get_google_sheet_id_from_input(sheet_id_input: str) -> str:
-    sheet_id = str(sheet_id_input or "").strip()
-    if sheet_id:
-        return sheet_id
-
-    try:
-        secret_sheet_id = str(st.secrets.get("GOOGLE_SHEET_ID", "")).strip()
-        if secret_sheet_id:
-            return secret_sheet_id
-    except Exception:
-        pass
-
-    st.error("Please enter the Google Sheet ID or add GOOGLE_SHEET_ID to Streamlit secrets.")
-    st.stop()
-
-
-def get_gspread_client():
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive.readonly",
-    ]
-
-    if "gcp_service_account" not in st.secrets:
-        st.error("Google Sheets connection is not set up. Please add [gcp_service_account] to Streamlit secrets.")
-        st.stop()
-
-    creds = Credentials.from_service_account_info(
-        dict(st.secrets["gcp_service_account"]),
-        scopes=scopes,
-    )
-    return gspread.authorize(creds)
+def extract_sheet_id(value: str) -> str:
+    value = str(value or "").strip()
+    match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", value)
+    if match:
+        return match.group(1)
+    return value
 
 
 @st.cache_data(ttl=60)
-def read_google_sheet_tab_cached(sheet_id: str, worksheet_name: str) -> pd.DataFrame:
-    client = get_gspread_client()
-    sh = client.open_by_key(sheet_id)
-    ws = sh.worksheet(worksheet_name)
-    rows = ws.get_all_records()
-    return pd.DataFrame(rows)
-
-
-def read_google_sheet_tab(sheet_id: str, worksheet_name: str, label_for_error: str) -> pd.DataFrame:
+def read_google_sheet_tab(sheet_id_or_url: str, worksheet_name: str) -> pd.DataFrame:
+    sheet_id = extract_sheet_id(sheet_id_or_url)
+    sheet = quote(str(worksheet_name), safe="")
+    url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet={sheet}"
     try:
-        df = read_google_sheet_tab_cached(sheet_id, worksheet_name)
+        df = pd.read_csv(url)
     except Exception as e:
-        st.error(f"Could not read the '{worksheet_name}' tab for {label_for_error}: {e}")
-        st.stop()
-
+        raise RuntimeError(
+            f"Could not read tab '{worksheet_name}'. Make sure the Google Sheet is shared as 'Anyone with the link - Viewer'. Error: {e}"
+        )
+    df = df.dropna(how="all")
     if df.empty:
-        st.error(f"The '{worksheet_name}' tab for {label_for_error} is empty.")
-        st.stop()
-
+        raise RuntimeError(f"The tab '{worksheet_name}' is empty or could not be read.")
+    df.columns = [str(c).strip() for c in df.columns]
     return df
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Optional Brooklyn exclusions upload
 # ──────────────────────────────────────────────────────────────────────────────
-
 def read_csv_robust(uploaded_file, label_for_error):
     raw = uploaded_file.getvalue()
     encodings = ["utf-8", "utf-8-sig", "cp1252", "iso-8859-1"]
     seps = [None, ",", ";", "\t", "|"]
     last_err = None
-
     for enc in encodings:
         for sep in seps:
             try:
@@ -234,7 +193,6 @@ def read_csv_robust(uploaded_file, label_for_error):
                 return df
             except Exception as e:
                 last_err = f"{type(e).__name__}: {e}"
-
     st.error(f"Could not read {label_for_error}. Last error: {last_err}")
     st.stop()
 
@@ -254,34 +212,21 @@ def read_table_any(uploaded_file, label_for_error):
 
 def parse_brooklyn_exclusions(excl_df: pd.DataFrame):
     if excl_df is None or excl_df.empty:
-        return set(), "No exclusions."
-
+        return set(), "No Brooklyn exclusions uploaded."
     possible_name_cols = ["Serving Girl", "Name & Surname", "Name and Surname", "Name", "Full name", "Full names"]
-    name_col = None
-    for cand in possible_name_cols:
-        if cand in excl_df.columns:
-            name_col = cand
-            break
-    if name_col is None:
-        name_col = excl_df.columns[0]
-
-    excluded = set()
-    for _, row in excl_df.iterrows():
-        nm = norm_name(row.get(name_col, ""))
-        if nm:
-            excluded.add(nm)
-
-    return excluded, f"Exclusions loaded: {len(excluded)} people blocked from Brooklyn roles."
+    name_col = next((c for c in possible_name_cols if c in excl_df.columns), excl_df.columns[0])
+    excluded = {norm_name(v) for v in excl_df[name_col].dropna() if norm_name(v)}
+    return excluded, f"Brooklyn exclusions loaded: {len(excluded)} people blocked from Brooklyn roles."
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Column detection
 # ──────────────────────────────────────────────────────────────────────────────
-
 def get_column_by_candidates(df: pd.DataFrame, candidates: list[str], required=True, label="column"):
     cols_l = {str(c).strip().lower(): c for c in df.columns}
     for cand in candidates:
-        if cand.strip().lower() in cols_l:
-            return cols_l[cand.strip().lower()]
+        key = cand.strip().lower()
+        if key in cols_l:
+            return cols_l[key]
     if required:
         st.error(f"Could not detect {label}. Expected one of: {', '.join(candidates)}")
         st.stop()
@@ -317,7 +262,6 @@ def detect_availability_month_column(df: pd.DataFrame):
 # ──────────────────────────────────────────────────────────────────────────────
 # Mapping sheet parsing
 # ──────────────────────────────────────────────────────────────────────────────
-
 def parse_mapping_sheet(mapping_df: pd.DataFrame):
     code_col = get_column_by_candidates(
         mapping_df,
@@ -338,17 +282,10 @@ def parse_mapping_sheet(mapping_df: pd.DataFrame):
         if is_blank_or_na(code):
             continue
         display = clean_text(row.get(display_col, "")) or code
-
-        capacities = {}
-        for campus in CAMPUS_ORDER:
-            if campus in mapping_df.columns:
-                capacities[campus] = to_int_capacity(row.get(campus, 0))
-            else:
-                capacities[campus] = 0
-
-        is_director = code in DIRECTOR_CODES or "director" in normalize(display)
-        is_leader = ("leader" in normalize(display)) or code.endswith("L") or code in {"BL", "PL", "EL", "SL", "L"}
-
+        capacities = {campus: to_int_capacity(row.get(campus, 0)) if campus in mapping_df.columns else 0 for campus in CAMPUS_ORDER}
+        display_norm = normalize(display)
+        is_director = code in DIRECTOR_CODES or "director" in display_norm
+        is_leader = "leader" in display_norm or code.endswith("L") or code in {"BL", "PL", "EL", "SL", "L"}
         mapping[code] = {
             "code": code,
             "display": display,
@@ -360,13 +297,11 @@ def parse_mapping_sheet(mapping_df: pd.DataFrame):
     if not mapping:
         st.error("No valid codes were found in the Mapping sheet.")
         st.stop()
-
     return mapping
 
 # ──────────────────────────────────────────────────────────────────────────────
 # ServingBase parsing
 # ──────────────────────────────────────────────────────────────────────────────
-
 def parse_codes_from_cell(value):
     if is_blank_or_na(value):
         return []
@@ -385,9 +320,9 @@ def priority_from_col(col_name: str) -> int | None:
     col = str(col_name).strip().upper()
     if col == "5":
         return 5
-    m = re.match(r"^([1-4])[A-E]$", col)
-    if m:
-        return int(m.group(1))
+    match = re.match(r"^([1-4])[A-E]$", col)
+    if match:
+        return int(match.group(1))
     return None
 
 
@@ -430,8 +365,8 @@ def parse_serving_base(serving_df: pd.DataFrame, mapping: dict):
         priorities = defaultdict(set)
         all_codes = set()
         for col in available_priority_cols:
-            pr = priority_from_col(col)
-            if pr is None:
+            priority = priority_from_col(col)
+            if priority is None:
                 continue
             for code in parse_codes_from_cell(row.get(col, "")):
                 if code in DIRECTOR_CODES:
@@ -441,7 +376,7 @@ def parse_serving_base(serving_df: pd.DataFrame, mapping: dict):
                     continue
                 if mapping[code]["is_director"]:
                     continue
-                priorities[pr].add(code)
+                priorities[priority].add(code)
                 all_codes.add(code)
 
         if not all_codes:
@@ -453,20 +388,18 @@ def parse_serving_base(serving_df: pd.DataFrame, mapping: dict):
             "director": clean_text(row.get(director_col, "")) if director_col else "",
             "campus": campus,
             "group": group,
-            "priorities": {pr: sorted(codes) for pr, codes in priorities.items()},
+            "priorities": {p: sorted(codes) for p, codes in priorities.items()},
             "all_codes": all_codes,
         }
 
     if not people:
         st.error("No schedulable serving girls were found in ServingBase after directors and invalid rows were ignored.")
         st.stop()
-
     return people, ignored_directors, unknown_codes
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Responses / availability parsing
 # ──────────────────────────────────────────────────────────────────────────────
-
 def extract_day_month_from_text(text: str):
     parts = re.findall(r"[0-9]{1,2}|[A-Za-z]{3,}", str(text))
     for i in range(len(parts) - 1):
@@ -486,9 +419,9 @@ def infer_year_from_responses(responses_df: pd.DataFrame, service_month: int) ->
             parsed = pd.to_datetime(raw, errors="coerce")
             if pd.notna(parsed):
                 return int(parsed.year)
-            m = re.search(r"(20\d{2})[-/](\d{1,2})", raw)
-            if m:
-                return int(m.group(1))
+            match = re.search(r"(20\d{2})[-/](\d{1,2})", raw)
+            if match:
+                return int(match.group(1))
 
     submission_year = date.today().year
     submission_month = date.today().month
@@ -508,13 +441,10 @@ def infer_year_from_responses(responses_df: pd.DataFrame, service_month: int) ->
 
 
 def detect_availability_date_columns(responses_df: pd.DataFrame):
-    admin_norm = {
-        normalize(x) for x in [
-            "timestamp", "time stamp", "availability", "availability month", "month",
-            "director", "serving girl", "serving girl name", "reason",
-        ]
-    }
-
+    admin_norm = {normalize(x) for x in [
+        "timestamp", "time stamp", "availability", "availability month", "month",
+        "director", "serving girl", "serving girl name", "reason",
+    ]}
     detected = []
     for col in responses_df.columns:
         if normalize(col) in admin_norm:
@@ -530,7 +460,6 @@ def detect_availability_date_columns(responses_df: pd.DataFrame):
     if not detected:
         st.error("No availability date columns were detected in Responses. Use headers like '7 June' or '21 June - Family Service'.")
         st.stop()
-
     return detected
 
 
@@ -550,11 +479,7 @@ def build_date_map_from_responses(responses_df: pd.DataFrame):
 
     service_month = list(months)[0]
     service_year = infer_year_from_responses(responses_df, service_month)
-
-    date_map = {}
-    for col, day, month in month_info:
-        date_map[col] = pd.Timestamp(datetime(service_year, month, day)).normalize()
-
+    date_map = {col: pd.Timestamp(datetime(service_year, month, day)).normalize() for col, day, month in month_info}
     service_dates = sorted(set(date_map.values()))
     sheet_name = f"{service_dates[0]:%B %Y}"
     return date_map, service_dates, sheet_name
@@ -564,20 +489,17 @@ def dedupe_latest_responses(responses_df: pd.DataFrame, person_col: str):
     df = responses_df.copy()
     df["_person"] = df[person_col].map(norm_name)
     df = df[df["_person"].astype(str).str.strip() != ""]
-
     timestamp_col = detect_timestamp_column(df)
     if timestamp_col:
         df["_ts"] = pd.to_datetime(df[timestamp_col], errors="coerce")
         df = df.sort_values("_ts")
         return df.groupby("_person", as_index=False).tail(1).drop(columns=["_ts"])
-
     return df.groupby("_person", as_index=False).tail(1)
 
 
 def parse_availability(responses_df: pd.DataFrame, people: dict, date_map: dict):
     person_col = detect_serving_girl_column(responses_df)
     latest = dedupe_latest_responses(responses_df, person_col)
-
     availability = {person: {dt: False for dt in date_map.values()} for person in people.keys()}
     display_from_responses = {}
     yes_counts = Counter()
@@ -600,7 +522,6 @@ def parse_availability(responses_df: pd.DataFrame, people: dict, date_map: dict)
 # ──────────────────────────────────────────────────────────────────────────────
 # Slot building
 # ──────────────────────────────────────────────────────────────────────────────
-
 def build_role_slots(mapping: dict, include_campuses: list[str]):
     slots = []
     for campus in include_campuses:
@@ -628,11 +549,10 @@ def build_role_slots(mapping: dict, include_campuses: list[str]):
 # ──────────────────────────────────────────────────────────────────────────────
 # Scheduling rules
 # ──────────────────────────────────────────────────────────────────────────────
-
 def person_priority_for_code(person_info: dict, code: str):
-    for pr in [1, 2, 3, 4, 5]:
-        if code in person_info["priorities"].get(pr, []):
-            return pr
+    for priority in [1, 2, 3, 4, 5]:
+        if code in person_info["priorities"].get(priority, []):
+            return priority
     return None
 
 
@@ -648,14 +568,10 @@ def group_allowed_for_role(person_info: dict, slot: dict, leader_group: str):
 def campus_allowed_for_role(person_info: dict, slot: dict):
     person_campus = person_info["campus"]
     slot_campus = slot["campus"]
-
     if slot_campus == person_campus:
         return True
-
-    # Brooklyn is shared with UC, but only where the person has the Brooklyn role code in their priorities.
     if slot_campus == "BRK" and person_campus == "UC" and slot["code"] in person_info["all_codes"]:
         return True
-
     return False
 
 
@@ -663,19 +579,7 @@ def is_assigned_on_date(schedule_cells, person, service_date):
     return any(person in names for (_slot_id, d), names in schedule_cells.items() if d == service_date)
 
 
-def can_assign(
-    *,
-    person,
-    person_info,
-    slot,
-    service_date,
-    schedule_cells,
-    availability,
-    assign_count,
-    monthly_cap,
-    leader_group,
-    brooklyn_excluded,
-):
+def can_assign(*, person, person_info, slot, service_date, schedule_cells, availability, assign_count, monthly_cap, leader_group, brooklyn_excluded):
     if assign_count.get(person, 0) >= monthly_cap:
         return False
     if is_assigned_on_date(schedule_cells, person, service_date):
@@ -696,53 +600,38 @@ def can_assign(
 def candidate_sort_key(person, person_info, priority, assign_count, availability, service_dates):
     yes_total = sum(1 for d in service_dates if availability.get(person, {}).get(d, False))
     group_rank = 0 if person_info.get("group") in {"A", "B"} else 1
-    return (
-        assign_count.get(person, 0),
-        priority if priority is not None else 99,
-        yes_total,
-        group_rank,
-        person_info["display"].lower(),
-    )
+    return (assign_count.get(person, 0), priority if priority is not None else 99, yes_total, group_rank, person_info["display"].lower())
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Scheduling engine
 # ──────────────────────────────────────────────────────────────────────────────
-
 def generate_schedule(people, mapping, availability, service_dates, monthly_cap, leader_group, brooklyn_excluded, include_campuses):
     slots = build_role_slots(mapping, include_campuses)
     schedule_cells = {(slot["slot_id"], d): [] for slot in slots for d in service_dates}
     assign_count = Counter()
-
     slots_by_id = {s["slot_id"]: s for s in slots}
 
     # Pass 1: Try to give every person one first-priority assignment.
     people_order = sorted(
         people.keys(),
-        key=lambda p: (
-            sum(1 for d in service_dates if availability.get(p, {}).get(d, False)),
-            people[p]["display"].lower(),
-        ),
+        key=lambda p: (sum(1 for d in service_dates if availability.get(p, {}).get(d, False)), people[p]["display"].lower()),
     )
-
     for person in people_order:
         person_info = people[person]
         p1_codes = set(person_info["priorities"].get(1, []))
         if not p1_codes:
             continue
-
         assigned = False
         for service_date in service_dates:
             if assigned:
                 break
             if not availability.get(person, {}).get(service_date, False):
                 continue
-
             candidate_slots = [
                 s for s in slots
-                if s["code"] in p1_codes and len(schedule_cells[(s["slot_id"], service_date)]) == 0
+                if s["code"] in p1_codes and not schedule_cells[(s["slot_id"], service_date)]
             ]
             candidate_slots.sort(key=lambda s: (0 if s["campus"] == person_info["campus"] else 1, s["sort_key"]))
-
             for slot in candidate_slots:
                 if can_assign(
                     person=person,
@@ -767,7 +656,6 @@ def generate_schedule(people, mapping, availability, service_dates, monthly_cap,
             key = (slot["slot_id"], service_date)
             if schedule_cells[key]:
                 continue
-
             candidates = []
             for person, person_info in people.items():
                 priority = person_priority_for_code(person_info, slot["code"])
@@ -787,33 +675,24 @@ def generate_schedule(people, mapping, availability, service_dates, monthly_cap,
                 ):
                     continue
                 candidates.append((person, priority))
-
             if candidates:
-                candidates.sort(
-                    key=lambda t: candidate_sort_key(
-                        t[0], people[t[0]], t[1], assign_count, availability, service_dates
-                    )
-                )
+                candidates.sort(key=lambda t: candidate_sort_key(t[0], people[t[0]], t[1], assign_count, availability, service_dates))
                 chosen = candidates[0][0]
                 schedule_cells[key].append(chosen)
                 assign_count[chosen] += 1
 
-    # Info outputs
     served_p1 = set()
     for (slot_id, _d), assigned_people in schedule_cells.items():
         slot = slots_by_id[slot_id]
         for person in assigned_people:
             if slot["code"] in people[person]["priorities"].get(1, []):
                 served_p1.add(person)
-
     unmet_p1 = sorted([p for p in people if people[p]["priorities"].get(1) and p not in served_p1])
-
     return schedule_cells, assign_count, slots, unmet_p1
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Output tables
 # ──────────────────────────────────────────────────────────────────────────────
-
 def build_schedule_df(schedule_cells, slots, service_dates, people):
     rows = []
     for slot in slots:
@@ -832,7 +711,6 @@ def build_assignment_summary(schedule_cells, slots, service_dates, people):
         slot = slot_by_id[slot_id]
         for p in assigned_people:
             per[p].append(f"{d.strftime('%Y-%m-%d')} — {slot['slot_label']}")
-
     rows = []
     for p, items in per.items():
         rows.append({
@@ -848,12 +726,11 @@ def build_assignment_summary(schedule_cells, slots, service_dates, people):
     return df.sort_values(["Assignments", "Person"], ascending=[False, True]).reset_index(drop=True)
 
 
-def build_unscheduled_available(schedule_cells, slots, service_dates, people, availability):
+def build_unscheduled_available(schedule_cells, service_dates, people, availability):
     scheduled_by_date = defaultdict(set)
     for (_slot_id, d), assigned_people in schedule_cells.items():
         for p in assigned_people:
             scheduled_by_date[d].add(p)
-
     max_len = 0
     per_date = {}
     for d in service_dates:
@@ -864,7 +741,6 @@ def build_unscheduled_available(schedule_cells, slots, service_dates, people, av
         names.sort(key=lambda x: (x[0], x[1]))
         per_date[d] = names
         max_len = max(max_len, len(names))
-
     data = {}
     for d in service_dates:
         date_label = d.strftime("%Y-%m-%d")
@@ -890,12 +766,11 @@ def build_unknown_codes_df(unknown_codes):
 # ──────────────────────────────────────────────────────────────────────────────
 # UI
 # ──────────────────────────────────────────────────────────────────────────────
-
 st.subheader("1) Google Sheet source")
 sheet_id_input = st.text_input(
-    "Google Sheet ID",
-    value=get_default_sheet_id_for_ui(),
-    help="Paste the long Sheet ID from the Google Sheet URL, or add GOOGLE_SHEET_ID to Streamlit secrets.",
+    "Google Sheet ID or full Google Sheet URL",
+    value="",
+    help="Paste the long Sheet ID or the full Google Sheet URL. The Sheet must be shared as 'Anyone with the link - Viewer'.",
 )
 
 c1, c2, c3 = st.columns(3)
@@ -915,19 +790,13 @@ exclusions_file = st.file_uploader(
 
 st.subheader("3) Settings")
 cap_options = [1, 2, 3, 4, 5, 6]
-selected_cap = st.selectbox(
-    "Maximum number of times a girl may serve this month",
-    options=cap_options,
-    index=cap_options.index(2),
-)
-
+selected_cap = st.selectbox("Maximum number of times a girl may serve this month", options=cap_options, index=1)
 leader_group = st.radio(
     "Which group serves as leaders this month?",
     options=["A", "B"],
     horizontal=True,
     help="The other group is blocked from leader roles for this schedule.",
 )
-
 include_campuses = st.multiselect(
     "Campuses to schedule",
     options=CAMPUS_ORDER,
@@ -935,28 +804,32 @@ include_campuses = st.multiselect(
     format_func=lambda x: f"{x} - {CAMPUS_LABELS.get(x, x)}",
 )
 
-st.caption("• Availability is read directly from the Responses tab.")
-st.caption("• Serving priorities are read directly from ServingBase columns 1A–5.")
-st.caption("• Role names and quantities are read from the Mapping sheet.")
+st.caption("• No gspread is used. If the app cannot read the sheet, set sharing to: Anyone with the link → Viewer.")
+st.caption("• Availability is read from Responses. Serving priorities are read from ServingBase. Role quantities are read from Mapping sheet.")
 st.caption("• Brooklyn is filled by UC people only where their own priority codes contain the Brooklyn role code.")
 st.caption("• Director rows/codes are ignored for now.")
 
 if st.button("Generate Schedule", type="primary"):
+    if not sheet_id_input.strip():
+        st.error("Please paste the Google Sheet ID or full Google Sheet URL.")
+        st.stop()
     if not include_campuses:
         st.error("Please select at least one campus to schedule.")
         st.stop()
 
-    sheet_id = get_google_sheet_id_from_input(sheet_id_input)
+    try:
+        responses_df = read_google_sheet_tab(sheet_id_input, responses_tab)
+        serving_df = read_google_sheet_tab(sheet_id_input, servingbase_tab)
+        mapping_df = read_google_sheet_tab(sheet_id_input, mapping_tab)
+    except Exception as e:
+        st.error(str(e))
+        st.stop()
 
-    responses_df = read_google_sheet_tab(sheet_id, responses_tab, "availability responses")
-    serving_df = read_google_sheet_tab(sheet_id, servingbase_tab, "serving base")
-    mapping_df = read_google_sheet_tab(sheet_id, mapping_tab, "mapping sheet")
     exclusions_df = read_table_any(exclusions_file, "Brooklyn exclusions") if exclusions_file else None
 
     mapping = parse_mapping_sheet(mapping_df)
     people, ignored_directors, unknown_codes = parse_serving_base(serving_df, mapping)
     brooklyn_excluded, exclusion_summary = parse_brooklyn_exclusions(exclusions_df)
-
     date_map, service_dates, sheet_name = build_date_map_from_responses(responses_df)
     availability, few_yes, display_from_responses = parse_availability(responses_df, people, date_map)
 
@@ -977,7 +850,7 @@ if st.button("Generate Schedule", type="primary"):
 
     schedule_df = build_schedule_df(schedule_cells, slots, service_dates, people)
     assignment_df = build_assignment_summary(schedule_cells, slots, service_dates, people)
-    unscheduled_df = build_unscheduled_available(schedule_cells, slots, service_dates, people, availability)
+    unscheduled_df = build_unscheduled_available(schedule_cells, service_dates, people, availability)
     detected_dates_df = build_detected_dates_df(date_map)
     unknown_codes_df = build_unknown_codes_df(unknown_codes)
 
@@ -1024,6 +897,8 @@ if st.button("Generate Schedule", type="primary"):
             "Group": [people[p]["group"] for p in unmet_p1],
         })
         st.dataframe(unmet_p1_df, use_container_width=True)
+    else:
+        unmet_p1_df = pd.DataFrame(columns=["Person", "Campus", "Group"])
 
     st.subheader("Unscheduled but Available")
     st.dataframe(unscheduled_df, use_container_width=True)
@@ -1034,7 +909,7 @@ if st.button("Generate Schedule", type="primary"):
         wb.remove(wb["Sheet"])
 
     def write_df(ws_name, df):
-        ws = wb.create_sheet(ws_name)
+        ws = wb.create_sheet(ws_name[:31])
         if df.empty:
             ws.append(["No data"])
         else:
@@ -1043,12 +918,11 @@ if st.button("Generate Schedule", type="primary"):
                 ws.append([row.get(col, "") for col in df.columns])
         excel_autofit(ws)
 
-    write_df(sheet_name[:31], schedule_df)
+    write_df(sheet_name, schedule_df)
     write_df("Assignment Summary", assignment_df)
     write_df("Detected Dates", detected_dates_df)
     write_df("Fewer than 2 Yes", few_yes_df)
-    if unmet_p1:
-        write_df("Unmet Priority 1", unmet_p1_df)
+    write_df("Unmet Priority 1", unmet_p1_df)
     write_df("Unscheduled", unscheduled_df)
     if not unknown_codes_df.empty:
         write_df("Unknown Codes", unknown_codes_df)
@@ -1056,7 +930,6 @@ if st.button("Generate Schedule", type="primary"):
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
-
     st.download_button(
         "Download Excel (.xlsx)",
         data=buf,
@@ -1064,4 +937,4 @@ if st.button("Generate Schedule", type="primary"):
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 else:
-    st.info("Confirm the Google Sheet tabs and settings, then click **Generate Schedule**.")
+    st.info("Paste your Google Sheet ID/URL, confirm the tab names and settings, then click **Generate Schedule**.")
