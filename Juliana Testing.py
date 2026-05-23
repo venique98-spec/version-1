@@ -114,7 +114,7 @@ CAMPUS_LABELS = {
     "NEL": "Nelspruit",
     "POL": "Polokwane",
 }
-DIRECTOR_CODES = {"DIR", "D", "ND", "PD", "TD"}
+DIRECTOR_CODES = set()  # Directors are not ignored in this version.
 ADMIN_VALUES = {"", "N/A", "NA", "NONE", "NAN", "-"}
 PRIORITY_COLS = [
     "1A", "1B", "1C", "1D", "1E",
@@ -390,21 +390,43 @@ def parse_mapping_sheet(mapping_df: pd.DataFrame):
         label="mapping display name column",
     )
 
+    def find_col(possible_names):
+        normalised_cols = {normalize(c): c for c in mapping_df.columns}
+        for name in possible_names:
+            key = normalize(name)
+            if key in normalised_cols:
+                return normalised_cols[key]
+        return None
+
     mapping = {}
     for _, row in mapping_df.iterrows():
         code = clean_code(row.get(code_col, ""))
         if is_blank_or_na(code):
             continue
+
         display = clean_text(row.get(display_col, "")) or code
-        capacities = {campus: to_int_capacity(row.get(campus, 0)) if campus in mapping_df.columns else 0 for campus in CAMPUS_ORDER}
         display_norm = normalize(display)
-        is_director = code in DIRECTOR_CODES or "director" in display_norm
         is_leader = "leader" in display_norm or code.endswith("L") or code in {"BL", "PL", "EL", "SL", "L"}
+
+        capacities = {}
+        position_order = {}
+
+        for campus in CAMPUS_ORDER:
+            sg_col = find_col([
+                f"{campus} SG#", f"{campus} SG", f"{campus} Capacity", campus
+            ])
+            pos_col = find_col([
+                f"{campus} Position#", f"{campus} Position", f"{campus} Order", f"{campus} Sort"
+            ])
+
+            capacities[campus] = to_int_capacity(row.get(sg_col, 0)) if sg_col else 0
+            position_order[campus] = to_int_capacity(row.get(pos_col, 9999)) if pos_col else 9999
+
         mapping[code] = {
             "code": code,
             "display": display,
             "capacities": capacities,
-            "is_director": is_director,
+            "position_order": position_order,
             "is_leader": is_leader,
         }
 
@@ -465,10 +487,6 @@ def parse_serving_base(serving_df: pd.DataFrame, mapping: dict):
 
         position_raw = clean_text(row.get(position_col, "")) if position_col else ""
         position_codes = set(parse_codes_from_cell(position_raw))
-        if position_codes & DIRECTOR_CODES or "dir" in normalize(position_raw):
-            ignored_directors.append(name)
-            continue
-
         campus = clean_code(row.get(campus_col, ""))
         if campus not in CAMPUS_ORDER:
             continue
@@ -484,12 +502,8 @@ def parse_serving_base(serving_df: pd.DataFrame, mapping: dict):
             if priority is None:
                 continue
             for code in parse_codes_from_cell(row.get(col, "")):
-                if code in DIRECTOR_CODES:
-                    continue
                 if code not in mapping:
                     unknown_codes[code].add(name)
-                    continue
-                if mapping[code]["is_director"]:
                     continue
                 priorities[priority].add(code)
                 all_codes.add(code)
@@ -644,8 +658,6 @@ def build_role_slots(mapping: dict, include_campuses: list[str]):
     slots = []
     for campus in include_campuses:
         for code, info in mapping.items():
-            if info["is_director"]:
-                continue
             capacity = info["capacities"].get(campus, 0)
             if capacity <= 0:
                 continue
@@ -659,7 +671,7 @@ def build_role_slots(mapping: dict, include_campuses: list[str]):
                     "display": info["display"],
                     "slot_label": slot_label,
                     "is_leader": info["is_leader"],
-                    "sort_key": (CAMPUS_ORDER.index(campus), normalize(info["display"]), idx),
+                    "sort_key": (CAMPUS_ORDER.index(campus), info.get("position_order", {}).get(campus, 9999), normalize(info["display"]), idx),
                 })
     slots.sort(key=lambda x: x["sort_key"])
     return slots
@@ -911,9 +923,10 @@ include_campuses = st.multiselect(
 )
 
 st.caption(f"• Source tabs: {FIXED_RESPONSES_TAB}, {FIXED_SERVINGBASE_TAB}, {FIXED_MAPPING_TAB}.")
+st.caption("• Mapping sheet now supports campus-specific columns like UC SG#, UC Position#, TGB SG#, TGB Position#, etc.")
 st.caption(f"• Output tab: {FIXED_OUTPUT_TAB}.")
 st.caption("• Brooklyn is filled by UC people only where their own priority codes contain the Brooklyn role code.")
-st.caption("• Director rows/codes are ignored for now.")
+st.caption("• Nobody is ignored. Directors are included if they have valid priority codes and availability responses.")
 
 if st.button("Generate Schedule", type="primary"):
     if not include_campuses:
