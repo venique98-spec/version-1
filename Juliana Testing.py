@@ -1,38 +1,60 @@
 # ukids_scheduler_app.py
-# uKids Scheduler — fixed Google Sheets version, no setup inputs
+# uKids Scheduler — Google Sheets read/write version
+#
+# This version fixes the main issues in the previous code:
+# - Uses gspread/service account access instead of public CSV links.
+# - Reads private Google Sheets directly from your Streamlit secrets.
+# - Writes the generated schedule back to the Google Sheet tab: "Roster first draft".
+# - Clears and rewrites the output tab each time you click Generate Schedule.
+# - Keeps the Excel download option.
+# - Keeps the priority logic, campus logic, Brooklyn rule, director ignoring, and leader group blocking.
+#
+# Required Streamlit secrets:
+# 1) GOOGLE_SHEET_ID = "your_google_sheet_id"
+# 2) Your Google service account credentials.
+#
+# Supported credential formats:
+# Option A:
+# [gcp_service_account]
+# type = "service_account"
+# project_id = "..."
+# private_key_id = "..."
+# private_key = "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+# client_email = "..."
+# client_id = "..."
+# auth_uri = "https://accounts.google.com/o/oauth2/auth"
+# token_uri = "https://oauth2.googleapis.com/token"
+# auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"
+# client_x509_cert_url = "..."
+#
+# Option B:
+# GOOGLE_SERVICE_ACCOUNT_JSON = "{...full service account json...}"
 #
 # IMPORTANT:
-# - No gspread is used.
-# - No Google Sheet setup inputs are shown in the app.
-# - No Brooklyn exclusions upload is shown.
-# - The app reads fixed tabs from one Google Sheet:
-#     Responses
-#     ServingBase
-#     Mapping sheet
-#
-# Setup:
-# - Add GOOGLE_SHEET_ID to Streamlit secrets, OR paste your Sheet ID below in FIXED_GOOGLE_SHEET_ID.
-# - The Google Sheet must be shared as: Anyone with the link → Viewer.
+# Share the Google Sheet with the service account client_email as Editor.
 
 import io
 import re
+import json
 import base64
-from urllib.parse import quote
 from collections import defaultdict, Counter
 from datetime import datetime, date
 
 import pandas as pd
 import streamlit as st
+import gspread
+from google.oauth2.service_account import Credentials
 from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Fixed Google Sheet settings
 # ──────────────────────────────────────────────────────────────────────────────
-FIXED_GOOGLE_SHEET_ID = ""  # Optional: paste Sheet ID here, or use st.secrets["GOOGLE_SHEET_ID"]
+FIXED_GOOGLE_SHEET_ID = ""  # Optional fallback. Prefer st.secrets["GOOGLE_SHEET_ID"]
 FIXED_RESPONSES_TAB = "Responses"
 FIXED_SERVINGBASE_TAB = "ServingBase"
 FIXED_MAPPING_TAB = "Mapping sheet"
+FIXED_OUTPUT_TAB = "Roster first draft"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Page setup
@@ -149,8 +171,15 @@ def excel_autofit(ws):
             max_len = max(max_len, len(val))
         ws.column_dimensions[get_column_letter(col_idx)].width = min(max(12, max_len + 2), 80)
 
+
+def df_to_sheet_values(df: pd.DataFrame):
+    if df.empty:
+        return [["No data"]]
+    safe_df = df.fillna("").astype(str)
+    return [list(safe_df.columns)] + safe_df.values.tolist()
+
 # ──────────────────────────────────────────────────────────────────────────────
-# Google Sheets via CSV export — no gspread needed
+# Google Sheets via gspread
 # ──────────────────────────────────────────────────────────────────────────────
 def get_fixed_sheet_id() -> str:
     sheet_id = FIXED_GOOGLE_SHEET_ID.strip()
@@ -174,22 +203,134 @@ def extract_sheet_id(value: str) -> str:
     return value
 
 
-@st.cache_data(ttl=60)
-def read_google_sheet_tab(sheet_id_or_url: str, worksheet_name: str) -> pd.DataFrame:
-    sheet_id = extract_sheet_id(sheet_id_or_url)
-    sheet = quote(str(worksheet_name), safe="")
-    url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet={sheet}"
+def get_service_account_info() -> dict:
     try:
-        df = pd.read_csv(url)
+        if "gcp_service_account" in st.secrets:
+            return dict(st.secrets["gcp_service_account"])
+        if "GOOGLE_SERVICE_ACCOUNT_JSON" in st.secrets:
+            raw = st.secrets["GOOGLE_SERVICE_ACCOUNT_JSON"]
+            return json.loads(raw) if isinstance(raw, str) else dict(raw)
     except Exception as e:
-        raise RuntimeError(
-            f"Could not read tab '{worksheet_name}'. Make sure the Google Sheet is shared as 'Anyone with the link - Viewer'. Error: {e}"
+        st.error(f"Could not read Google service account details from secrets: {e}")
+        st.stop()
+
+    st.error(
+        "Google service account credentials are missing. Add [gcp_service_account] or GOOGLE_SERVICE_ACCOUNT_JSON to Streamlit secrets."
+    )
+    st.stop()
+
+
+@st.cache_resource(ttl=300)
+def get_gspread_client():
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    info = get_service_account_info()
+    try:
+        creds = Credentials.from_service_account_info(info, scopes=scopes)
+        return gspread.authorize(creds)
+    except Exception as e:
+        st.error(f"Could not authorise Google Sheets. Check your service account secrets. Error: {e}")
+        st.stop()
+
+
+def open_workbook():
+    sheet_id = extract_sheet_id(get_fixed_sheet_id())
+    client = get_gspread_client()
+    try:
+        return client.open_by_key(sheet_id)
+    except Exception as e:
+        st.error(
+            "Could not open the Google Sheet. Make sure the sheet ID is correct and the sheet is shared with the service account as Editor. "
+            f"Error: {e}"
         )
-    df = df.dropna(how="all")
-    if df.empty:
+        st.stop()
+
+
+@st.cache_data(ttl=60)
+def read_google_sheet_tab_cached(sheet_id: str, worksheet_name: str) -> pd.DataFrame:
+    client = get_gspread_client()
+    sh = client.open_by_key(extract_sheet_id(sheet_id))
+    try:
+        ws = sh.worksheet(worksheet_name)
+    except Exception as e:
+        raise RuntimeError(f"Could not find tab '{worksheet_name}'. Error: {e}")
+
+    values = ws.get_all_values()
+    if not values or not any(any(cell.strip() for cell in row) for row in values):
         raise RuntimeError(f"The tab '{worksheet_name}' is empty or could not be read.")
+
+    headers = [str(h).strip() for h in values[0]]
+    rows = values[1:]
+    width = len(headers)
+    fixed_rows = []
+    for row in rows:
+        fixed_rows.append((row + [""] * width)[:width])
+
+    df = pd.DataFrame(fixed_rows, columns=headers)
+    df = df.replace("", pd.NA).dropna(how="all").fillna("")
     df.columns = [str(c).strip() for c in df.columns]
     return df
+
+
+def read_google_sheet_tab(sheet_id: str, worksheet_name: str) -> pd.DataFrame:
+    return read_google_sheet_tab_cached(sheet_id, worksheet_name)
+
+
+def get_or_create_worksheet(sh, title: str, rows: int = 1000, cols: int = 50):
+    try:
+        return sh.worksheet(title)
+    except gspread.WorksheetNotFound:
+        return sh.add_worksheet(title=title, rows=rows, cols=cols)
+
+
+def write_output_to_google_sheet(schedule_df, assignment_df, unscheduled_df, detected_dates_df, few_yes_df, unmet_p1_df, unknown_codes_df, meta_rows):
+    sh = open_workbook()
+    ws = get_or_create_worksheet(sh, FIXED_OUTPUT_TAB, rows=1000, cols=80)
+    ws.clear()
+
+    output = []
+    output.append(["uKids Scheduler Output"])
+    output.extend(meta_rows)
+    output.append([])
+
+    sections = [
+        ("Schedule", schedule_df),
+        ("Assignment Summary", assignment_df),
+        ("Unscheduled but Available", unscheduled_df),
+        ("Detected Dates", detected_dates_df),
+        ("Fewer than 2 Yes", few_yes_df),
+        ("Unmet Priority 1", unmet_p1_df),
+    ]
+    if unknown_codes_df is not None and not unknown_codes_df.empty:
+        sections.append(("Unknown Codes", unknown_codes_df))
+
+    for title, df in sections:
+        output.append([title])
+        output.extend(df_to_sheet_values(df))
+        output.append([])
+        output.append([])
+
+    max_cols = max(len(row) for row in output) if output else 1
+    normalised = [row + [""] * (max_cols - len(row)) for row in output]
+
+    required_rows = max(len(normalised), 100)
+    required_cols = max(max_cols, 20)
+    try:
+        ws.resize(rows=required_rows, cols=required_cols)
+    except Exception:
+        pass
+
+    ws.update(normalised, value_input_option="USER_ENTERED")
+
+    try:
+        ws.freeze(rows=1)
+        ws.format("A1:Z1", {"textFormat": {"bold": True}})
+    except Exception:
+        pass
+
+    return ws.url
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Column detection
@@ -306,7 +447,8 @@ def parse_serving_base(serving_df: pd.DataFrame, mapping: dict):
     position_col = get_column_by_candidates(serving_df, ["Position", "Code", "Role Code"], required=False, label="Position column")
     group_col = get_column_by_candidates(serving_df, ["Group"], required=False, label="Group column")
 
-    available_priority_cols = [c for c in PRIORITY_COLS if c in serving_df.columns]
+    upper_col_map = {str(c).strip().upper(): c for c in serving_df.columns}
+    available_priority_cols = [upper_col_map[c] for c in PRIORITY_COLS if c in upper_col_map]
     if not available_priority_cols:
         st.error("No priority columns found in ServingBase. Expected columns like 1A, 1B, 2A, 3A, 4A, 4B, 5.")
         st.stop()
@@ -476,10 +618,13 @@ def parse_availability(responses_df: pd.DataFrame, people: dict, date_map: dict)
     availability = {person: {dt: False for dt in date_map.values()} for person in people.keys()}
     display_from_responses = {}
     yes_counts = Counter()
+    responders_not_in_base = set()
 
     for _, row in latest.iterrows():
         person = norm_name(row.get(person_col, ""))
         if person not in people:
+            if person:
+                responders_not_in_base.add(clean_text(row.get(person_col, "")))
             continue
         display_from_responses[person] = clean_text(row.get(person_col, ""))
         for col, dt in date_map.items():
@@ -490,7 +635,7 @@ def parse_availability(responses_df: pd.DataFrame, people: dict, date_map: dict)
                 yes_counts[person] += 1
 
     few_yes = sorted([p for p in people.keys() if yes_counts[p] < 2])
-    return availability, few_yes, display_from_responses
+    return availability, few_yes, display_from_responses, sorted(responders_not_in_base)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Slot building
@@ -588,7 +733,6 @@ def generate_schedule(people, mapping, availability, service_dates, monthly_cap,
     assign_count = Counter()
     slots_by_id = {s["slot_id"]: s for s in slots}
 
-    # Pass 1: Try to give every person one first-priority assignment.
     people_order = sorted(
         people.keys(),
         key=lambda p: (
@@ -597,6 +741,7 @@ def generate_schedule(people, mapping, availability, service_dates, monthly_cap,
         ),
     )
 
+    # Pass 1: try to give every person one first-priority assignment.
     for person in people_order:
         person_info = people[person]
         p1_codes = set(person_info["priorities"].get(1, []))
@@ -630,7 +775,7 @@ def generate_schedule(people, mapping, availability, service_dates, monthly_cap,
                     assigned = True
                     break
 
-    # Pass 2: Fill all remaining slots by priority 1 to 5.
+    # Pass 2: fill all remaining slots by priority 1 to 5.
     for service_date in service_dates:
         for slot in slots:
             key = (slot["slot_id"], service_date)
@@ -742,6 +887,10 @@ def build_unknown_codes_df(unknown_codes):
         rows.append({"Unknown code": code, "Found for": ", ".join(sorted(names))})
     return pd.DataFrame(rows)
 
+
+def build_not_in_base_df(responders_not_in_base):
+    return pd.DataFrame({"Responder not found in ServingBase": responders_not_in_base})
+
 # ──────────────────────────────────────────────────────────────────────────────
 # UI
 # ──────────────────────────────────────────────────────────────────────────────
@@ -761,8 +910,8 @@ include_campuses = st.multiselect(
     format_func=lambda x: f"{x} - {CAMPUS_LABELS.get(x, x)}",
 )
 
-st.caption("• Fixed source: Responses, ServingBase and Mapping sheet are read automatically from the Google Sheet.")
-st.caption("• No file uploads are required.")
+st.caption(f"• Source tabs: {FIXED_RESPONSES_TAB}, {FIXED_SERVINGBASE_TAB}, {FIXED_MAPPING_TAB}.")
+st.caption(f"• Output tab: {FIXED_OUTPUT_TAB}.")
 st.caption("• Brooklyn is filled by UC people only where their own priority codes contain the Brooklyn role code.")
 st.caption("• Director rows/codes are ignored for now.")
 
@@ -784,7 +933,7 @@ if st.button("Generate Schedule", type="primary"):
     mapping = parse_mapping_sheet(mapping_df)
     people, ignored_directors, unknown_codes = parse_serving_base(serving_df, mapping)
     date_map, service_dates, sheet_name = build_date_map_from_responses(responses_df)
-    availability, few_yes, display_from_responses = parse_availability(responses_df, people, date_map)
+    availability, few_yes, display_from_responses, responders_not_in_base = parse_availability(responses_df, people, date_map)
 
     for person, display in display_from_responses.items():
         if person in people and display:
@@ -806,11 +955,53 @@ if st.button("Generate Schedule", type="primary"):
     detected_dates_df = build_detected_dates_df(date_map)
     unknown_codes_df = build_unknown_codes_df(unknown_codes)
 
+    few_yes_df = pd.DataFrame({
+        "Person": [people[p]["display"] for p in few_yes if p in people],
+        "Campus": [people[p]["campus"] for p in few_yes if p in people],
+        "Group": [people[p]["group"] for p in few_yes if p in people],
+    })
+
+    if unmet_p1:
+        unmet_p1_df = pd.DataFrame({
+            "Person": [people[p]["display"] for p in unmet_p1],
+            "Campus": [people[p]["campus"] for p in unmet_p1],
+            "Group": [people[p]["group"] for p in unmet_p1],
+        })
+    else:
+        unmet_p1_df = pd.DataFrame(columns=["Person", "Campus", "Group"])
+
     total_slots = len(slots) * len(service_dates)
     filled_slots = sum(1 for names in schedule_cells.values() if names)
     fill_rate = filled_slots / total_slots if total_slots else 0
 
-    st.success(f"Schedule generated for **{sheet_name}**")
+    meta_rows = [
+        ["Generated at", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
+        ["Schedule month", sheet_name],
+        ["Filled slots", f"{filled_slots} / {total_slots}"],
+        ["Fill rate", f"{fill_rate:.1%}"],
+        ["Monthly cap", str(selected_cap)],
+        ["Leader group", leader_group],
+        ["Campuses", ", ".join(include_campuses)],
+        ["Ignored director rows", str(len(ignored_directors))],
+        ["Responders not found in ServingBase", str(len(responders_not_in_base))],
+    ]
+
+    try:
+        output_url = write_output_to_google_sheet(
+            schedule_df=schedule_df,
+            assignment_df=assignment_df,
+            unscheduled_df=unscheduled_df,
+            detected_dates_df=detected_dates_df,
+            few_yes_df=few_yes_df,
+            unmet_p1_df=unmet_p1_df,
+            unknown_codes_df=unknown_codes_df,
+            meta_rows=meta_rows,
+        )
+        st.success(f"Schedule generated for **{sheet_name}** and written to **{FIXED_OUTPUT_TAB}**.")
+        st.markdown(f"[Open the output tab]({output_url})")
+    except Exception as e:
+        st.error(f"The schedule was generated, but could not be written to Google Sheets. Error: {e}")
+
     st.write(
         f"Filled slots: **{filled_slots} / {total_slots}** "
         f"(Fill rate: **{fill_rate:.1%}**) • Monthly cap: **{selected_cap}** • Leader group: **{leader_group}**"
@@ -821,6 +1012,10 @@ if st.button("Generate Schedule", type="primary"):
 
     if ignored_directors:
         st.info(f"Ignored director rows: {len(ignored_directors)}")
+
+    if responders_not_in_base:
+        st.warning("Some responses were submitted by names that were not found in ServingBase.")
+        st.dataframe(build_not_in_base_df(responders_not_in_base), use_container_width=True)
 
     if not unknown_codes_df.empty:
         st.warning("Some ServingBase codes were not found in the Mapping sheet and were ignored.")
@@ -833,23 +1028,10 @@ if st.button("Generate Schedule", type="primary"):
     st.dataframe(assignment_df, use_container_width=True)
 
     st.subheader("People with fewer than 2 Yes dates - info")
-    few_yes_df = pd.DataFrame({
-        "Person": [people[p]["display"] for p in few_yes if p in people],
-        "Campus": [people[p]["campus"] for p in few_yes if p in people],
-        "Group": [people[p]["group"] for p in few_yes if p in people],
-    })
     st.dataframe(few_yes_df, use_container_width=True)
 
-    if unmet_p1:
-        st.subheader("Unmet Priority-1 - info")
-        unmet_p1_df = pd.DataFrame({
-            "Person": [people[p]["display"] for p in unmet_p1],
-            "Campus": [people[p]["campus"] for p in unmet_p1],
-            "Group": [people[p]["group"] for p in unmet_p1],
-        })
-        st.dataframe(unmet_p1_df, use_container_width=True)
-    else:
-        unmet_p1_df = pd.DataFrame(columns=["Person", "Campus", "Group"])
+    st.subheader("Unmet Priority-1 - info")
+    st.dataframe(unmet_p1_df, use_container_width=True)
 
     st.subheader("Unscheduled but Available")
     st.dataframe(unscheduled_df, use_container_width=True)
@@ -876,6 +1058,8 @@ if st.button("Generate Schedule", type="primary"):
     write_df("Unscheduled", unscheduled_df)
     if not unknown_codes_df.empty:
         write_df("Unknown Codes", unknown_codes_df)
+    if responders_not_in_base:
+        write_df("Names Not In Base", build_not_in_base_df(responders_not_in_base))
 
     buf = io.BytesIO()
     wb.save(buf)
