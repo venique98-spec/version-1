@@ -1,25 +1,18 @@
 # ukids_scheduler_app.py
-# uKids Scheduler — Google Sheets CSV-link version
+# uKids Scheduler — fixed Google Sheets version, no setup inputs
 #
-# IMPORTANT FIX:
-# - This version does NOT import gspread.
-# - It reads Google Sheets tabs through Google's CSV export link using only pandas.
-# - Your Google Sheet must be accessible to the deployed app by link.
-#   In Google Sheets: Share → General access → Anyone with the link → Viewer.
+# IMPORTANT:
+# - No gspread is used.
+# - No Google Sheet setup inputs are shown in the app.
+# - No Brooklyn exclusions upload is shown.
+# - The app reads fixed tabs from one Google Sheet:
+#     Responses
+#     ServingBase
+#     Mapping sheet
 #
-# Data sources:
-# - Responses tab: availability answers and service date columns.
-# - ServingBase tab: serving girls, campus, group, and priority codes.
-# - Mapping sheet tab: code meanings and required quantities per campus.
-#
-# Rules:
-# - Directors / director codes are ignored for now.
-# - People are scheduled separately by campus.
-# - Brooklyn roles may be filled by UC people only if their own priority codes contain that Brooklyn role code.
-# - Group A/B leader rotation is blocked.
-# - Every serving girl is first attempted into one first-priority role per month where possible.
-# - No person is scheduled twice on the same date.
-# - Monthly cap applies.
+# Setup:
+# - Add GOOGLE_SHEET_ID to Streamlit secrets, OR paste your Sheet ID below in FIXED_GOOGLE_SHEET_ID.
+# - The Google Sheet must be shared as: Anyone with the link → Viewer.
 
 import io
 import re
@@ -32,6 +25,14 @@ import pandas as pd
 import streamlit as st
 from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Fixed Google Sheet settings
+# ──────────────────────────────────────────────────────────────────────────────
+FIXED_GOOGLE_SHEET_ID = ""  # Optional: paste Sheet ID here, or use st.secrets["GOOGLE_SHEET_ID"]
+FIXED_RESPONSES_TAB = "Responses"
+FIXED_SERVINGBASE_TAB = "ServingBase"
+FIXED_MAPPING_TAB = "Mapping sheet"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Page setup
@@ -151,6 +152,20 @@ def excel_autofit(ws):
 # ──────────────────────────────────────────────────────────────────────────────
 # Google Sheets via CSV export — no gspread needed
 # ──────────────────────────────────────────────────────────────────────────────
+def get_fixed_sheet_id() -> str:
+    sheet_id = FIXED_GOOGLE_SHEET_ID.strip()
+    if sheet_id:
+        return sheet_id
+    try:
+        sheet_id = str(st.secrets.get("GOOGLE_SHEET_ID", "")).strip()
+        if sheet_id:
+            return sheet_id
+    except Exception:
+        pass
+    st.error("Google Sheet ID is missing. Add GOOGLE_SHEET_ID to Streamlit secrets, or paste it into FIXED_GOOGLE_SHEET_ID in the code.")
+    st.stop()
+
+
 def extract_sheet_id(value: str) -> str:
     value = str(value or "").strip()
     match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", value)
@@ -175,48 +190,6 @@ def read_google_sheet_tab(sheet_id_or_url: str, worksheet_name: str) -> pd.DataF
         raise RuntimeError(f"The tab '{worksheet_name}' is empty or could not be read.")
     df.columns = [str(c).strip() for c in df.columns]
     return df
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Optional Brooklyn exclusions upload
-# ──────────────────────────────────────────────────────────────────────────────
-def read_csv_robust(uploaded_file, label_for_error):
-    raw = uploaded_file.getvalue()
-    encodings = ["utf-8", "utf-8-sig", "cp1252", "iso-8859-1"]
-    seps = [None, ",", ";", "\t", "|"]
-    last_err = None
-    for enc in encodings:
-        for sep in seps:
-            try:
-                df = pd.read_csv(io.BytesIO(raw), encoding=enc, engine="python", sep=sep)
-                if df.shape[1] == 0:
-                    raise ValueError("Parsed 0 columns.")
-                return df
-            except Exception as e:
-                last_err = f"{type(e).__name__}: {e}"
-    st.error(f"Could not read {label_for_error}. Last error: {last_err}")
-    st.stop()
-
-
-def read_table_any(uploaded_file, label_for_error):
-    if uploaded_file is None:
-        return None
-    name = uploaded_file.name.lower()
-    if name.endswith((".xlsx", ".xls")):
-        try:
-            return pd.read_excel(uploaded_file)
-        except Exception:
-            st.error(f"Could not read {label_for_error} Excel file. Please save as CSV or check the format.")
-            st.stop()
-    return read_csv_robust(uploaded_file, label_for_error)
-
-
-def parse_brooklyn_exclusions(excl_df: pd.DataFrame):
-    if excl_df is None or excl_df.empty:
-        return set(), "No Brooklyn exclusions uploaded."
-    possible_name_cols = ["Serving Girl", "Name & Surname", "Name and Surname", "Name", "Full name", "Full names"]
-    name_col = next((c for c in possible_name_cols if c in excl_df.columns), excl_df.columns[0])
-    excluded = {norm_name(v) for v in excl_df[name_col].dropna() if norm_name(v)}
-    return excluded, f"Brooklyn exclusions loaded: {len(excluded)} people blocked from Brooklyn roles."
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Column detection
@@ -579,7 +552,7 @@ def is_assigned_on_date(schedule_cells, person, service_date):
     return any(person in names for (_slot_id, d), names in schedule_cells.items() if d == service_date)
 
 
-def can_assign(*, person, person_info, slot, service_date, schedule_cells, availability, assign_count, monthly_cap, leader_group, brooklyn_excluded):
+def can_assign(*, person, person_info, slot, service_date, schedule_cells, availability, assign_count, monthly_cap, leader_group):
     if assign_count.get(person, 0) >= monthly_cap:
         return False
     if is_assigned_on_date(schedule_cells, person, service_date):
@@ -592,20 +565,24 @@ def can_assign(*, person, person_info, slot, service_date, schedule_cells, avail
         return False
     if not group_allowed_for_role(person_info, slot, leader_group):
         return False
-    if slot["campus"] == "BRK" and person in brooklyn_excluded:
-        return False
     return True
 
 
 def candidate_sort_key(person, person_info, priority, assign_count, availability, service_dates):
     yes_total = sum(1 for d in service_dates if availability.get(person, {}).get(d, False))
     group_rank = 0 if person_info.get("group") in {"A", "B"} else 1
-    return (assign_count.get(person, 0), priority if priority is not None else 99, yes_total, group_rank, person_info["display"].lower())
+    return (
+        assign_count.get(person, 0),
+        priority if priority is not None else 99,
+        yes_total,
+        group_rank,
+        person_info["display"].lower(),
+    )
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Scheduling engine
 # ──────────────────────────────────────────────────────────────────────────────
-def generate_schedule(people, mapping, availability, service_dates, monthly_cap, leader_group, brooklyn_excluded, include_campuses):
+def generate_schedule(people, mapping, availability, service_dates, monthly_cap, leader_group, include_campuses):
     slots = build_role_slots(mapping, include_campuses)
     schedule_cells = {(slot["slot_id"], d): [] for slot in slots for d in service_dates}
     assign_count = Counter()
@@ -614,8 +591,12 @@ def generate_schedule(people, mapping, availability, service_dates, monthly_cap,
     # Pass 1: Try to give every person one first-priority assignment.
     people_order = sorted(
         people.keys(),
-        key=lambda p: (sum(1 for d in service_dates if availability.get(p, {}).get(d, False)), people[p]["display"].lower()),
+        key=lambda p: (
+            sum(1 for d in service_dates if availability.get(p, {}).get(d, False)),
+            people[p]["display"].lower(),
+        ),
     )
+
     for person in people_order:
         person_info = people[person]
         p1_codes = set(person_info["priorities"].get(1, []))
@@ -643,7 +624,6 @@ def generate_schedule(people, mapping, availability, service_dates, monthly_cap,
                     assign_count=assign_count,
                     monthly_cap=monthly_cap,
                     leader_group=leader_group,
-                    brooklyn_excluded=brooklyn_excluded,
                 ):
                     schedule_cells[(slot["slot_id"], service_date)].append(person)
                     assign_count[person] += 1
@@ -671,7 +651,6 @@ def generate_schedule(people, mapping, availability, service_dates, monthly_cap,
                     assign_count=assign_count,
                     monthly_cap=monthly_cap,
                     leader_group=leader_group,
-                    brooklyn_excluded=brooklyn_excluded,
                 ):
                     continue
                 candidates.append((person, priority))
@@ -704,7 +683,7 @@ def build_schedule_df(schedule_cells, slots, service_dates, people):
     return pd.DataFrame(rows)
 
 
-def build_assignment_summary(schedule_cells, slots, service_dates, people):
+def build_assignment_summary(schedule_cells, slots, people):
     slot_by_id = {s["slot_id"]: s for s in slots}
     per = defaultdict(list)
     for (slot_id, d), assigned_people in schedule_cells.items():
@@ -766,29 +745,7 @@ def build_unknown_codes_df(unknown_codes):
 # ──────────────────────────────────────────────────────────────────────────────
 # UI
 # ──────────────────────────────────────────────────────────────────────────────
-st.subheader("1) Google Sheet source")
-sheet_id_input = st.text_input(
-    "Google Sheet ID or full Google Sheet URL",
-    value="",
-    help="Paste the long Sheet ID or the full Google Sheet URL. The Sheet must be shared as 'Anyone with the link - Viewer'.",
-)
-
-c1, c2, c3 = st.columns(3)
-with c1:
-    responses_tab = st.text_input("Responses tab name", value="Responses")
-with c2:
-    servingbase_tab = st.text_input("ServingBase tab name", value="ServingBase")
-with c3:
-    mapping_tab = st.text_input("Mapping sheet tab name", value="Mapping sheet")
-
-st.subheader("2) Optional file")
-exclusions_file = st.file_uploader(
-    "Last month Brooklyn exclusions (CSV/XLSX) - optional",
-    type=["csv", "xlsx", "xls"],
-    key="brooklyn_exclusions_upload",
-)
-
-st.subheader("3) Settings")
+st.subheader("1) Settings")
 cap_options = [1, 2, 3, 4, 5, 6]
 selected_cap = st.selectbox("Maximum number of times a girl may serve this month", options=cap_options, index=1)
 leader_group = st.radio(
@@ -804,32 +761,28 @@ include_campuses = st.multiselect(
     format_func=lambda x: f"{x} - {CAMPUS_LABELS.get(x, x)}",
 )
 
-st.caption("• No gspread is used. If the app cannot read the sheet, set sharing to: Anyone with the link → Viewer.")
-st.caption("• Availability is read from Responses. Serving priorities are read from ServingBase. Role quantities are read from Mapping sheet.")
+st.caption("• Fixed source: Responses, ServingBase and Mapping sheet are read automatically from the Google Sheet.")
+st.caption("• No file uploads are required.")
 st.caption("• Brooklyn is filled by UC people only where their own priority codes contain the Brooklyn role code.")
 st.caption("• Director rows/codes are ignored for now.")
 
 if st.button("Generate Schedule", type="primary"):
-    if not sheet_id_input.strip():
-        st.error("Please paste the Google Sheet ID or full Google Sheet URL.")
-        st.stop()
     if not include_campuses:
         st.error("Please select at least one campus to schedule.")
         st.stop()
 
+    sheet_id = get_fixed_sheet_id()
+
     try:
-        responses_df = read_google_sheet_tab(sheet_id_input, responses_tab)
-        serving_df = read_google_sheet_tab(sheet_id_input, servingbase_tab)
-        mapping_df = read_google_sheet_tab(sheet_id_input, mapping_tab)
+        responses_df = read_google_sheet_tab(sheet_id, FIXED_RESPONSES_TAB)
+        serving_df = read_google_sheet_tab(sheet_id, FIXED_SERVINGBASE_TAB)
+        mapping_df = read_google_sheet_tab(sheet_id, FIXED_MAPPING_TAB)
     except Exception as e:
         st.error(str(e))
         st.stop()
 
-    exclusions_df = read_table_any(exclusions_file, "Brooklyn exclusions") if exclusions_file else None
-
     mapping = parse_mapping_sheet(mapping_df)
     people, ignored_directors, unknown_codes = parse_serving_base(serving_df, mapping)
-    brooklyn_excluded, exclusion_summary = parse_brooklyn_exclusions(exclusions_df)
     date_map, service_dates, sheet_name = build_date_map_from_responses(responses_df)
     availability, few_yes, display_from_responses = parse_availability(responses_df, people, date_map)
 
@@ -844,12 +797,11 @@ if st.button("Generate Schedule", type="primary"):
         service_dates=service_dates,
         monthly_cap=int(selected_cap),
         leader_group=leader_group,
-        brooklyn_excluded=brooklyn_excluded,
         include_campuses=include_campuses,
     )
 
     schedule_df = build_schedule_df(schedule_cells, slots, service_dates, people)
-    assignment_df = build_assignment_summary(schedule_cells, slots, service_dates, people)
+    assignment_df = build_assignment_summary(schedule_cells, slots, people)
     unscheduled_df = build_unscheduled_available(schedule_cells, service_dates, people, availability)
     detected_dates_df = build_detected_dates_df(date_map)
     unknown_codes_df = build_unknown_codes_df(unknown_codes)
@@ -863,7 +815,6 @@ if st.button("Generate Schedule", type="primary"):
         f"Filled slots: **{filled_slots} / {total_slots}** "
         f"(Fill rate: **{fill_rate:.1%}**) • Monthly cap: **{selected_cap}** • Leader group: **{leader_group}**"
     )
-    st.caption(exclusion_summary)
 
     st.subheader("Detected availability dates")
     st.dataframe(detected_dates_df, use_container_width=True)
@@ -903,7 +854,6 @@ if st.button("Generate Schedule", type="primary"):
     st.subheader("Unscheduled but Available")
     st.dataframe(unscheduled_df, use_container_width=True)
 
-    # Excel export
     wb = Workbook()
     if "Sheet" in wb.sheetnames:
         wb.remove(wb["Sheet"])
@@ -937,4 +887,4 @@ if st.button("Generate Schedule", type="primary"):
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 else:
-    st.info("Paste your Google Sheet ID/URL, confirm the tab names and settings, then click **Generate Schedule**.")
+    st.info("Choose the settings, then click **Generate Schedule**.")
