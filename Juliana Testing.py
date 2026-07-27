@@ -123,6 +123,12 @@ PRIORITY_COLS = [
     "4A", "4B", "5",
 ]
 
+# Which time-of-day sessions we recognise in response column headers
+# (e.g. "2 August - Morning", "2 August - Evening"), and the hour used
+# internally to keep each session as a distinct point in time even
+# though they fall on the same calendar date.
+SESSION_HOUR = {"Morning": 8, "Afternoon": 13, "Evening": 18}
+
 # ──────────────────────────────────────────────────────────────────────────────
 # General helpers
 # ──────────────────────────────────────────────────────────────────────────────
@@ -465,8 +471,8 @@ def priority_from_col(col_name: str) -> int | None:
 def parse_serving_base(serving_df: pd.DataFrame, mapping: dict):
     director_col = get_column_by_candidates(serving_df, ["Director"], required=False, label="Director column")
     name_col = get_column_by_candidates(serving_df, ["Serving Girl", "Name", "Full name"], required=True, label="Serving Girl column")
-    campus_col = get_column_by_candidates(serving_df, ["Primary Campus", "Campus"], required=True, label="Primary Campus column")
-    position_col = get_column_by_candidates(serving_df, ["Position", "Code", "Role Code"], required=False, label="Position column")
+    campus_col = get_column_by_candidates(serving_df, ["Campus", "Primary Campus"], required=True, label="Campus column")
+    position_col = get_column_by_candidates(serving_df, ["Position", "Code", "Role Code", "Role"], required=False, label="Position column")
     group_col = get_column_by_candidates(serving_df, ["Group"], required=False, label="Group column")
 
     upper_col_map = {str(c).strip().upper(): c for c in serving_df.columns}
@@ -540,6 +546,29 @@ def extract_day_month_from_text(text: str):
     return None
 
 
+def extract_session_from_text(text: str):
+    """Pull the time-of-day session (Morning / Afternoon / Evening) out of a
+    response column header such as '2 August - Morning'. Returns None if no
+    session is mentioned, so older sheets with plain date headers still work."""
+    t = str(text).lower()
+    if "morning" in t:
+        return "Morning"
+    if "afternoon" in t:
+        return "Afternoon"
+    if "evening" in t:
+        return "Evening"
+    return None
+
+
+def format_service_label(dt: pd.Timestamp) -> str:
+    """Turn an internal date+session timestamp back into a readable label,
+    e.g. '2026-08-02 Morning'. Falls back to just the date if no session
+    was encoded (older single-service-per-day sheets)."""
+    session = {v: k for k, v in SESSION_HOUR.items()}.get(dt.hour)
+    base = dt.strftime("%Y-%m-%d")
+    return f"{base} {session}" if session else base
+
+
 def infer_year_from_responses(responses_df: pd.DataFrame, service_month: int) -> int:
     month_col = detect_availability_month_column(responses_df)
     if month_col:
@@ -587,28 +616,42 @@ def detect_availability_date_columns(responses_df: pd.DataFrame):
             detected.append(col)
 
     if not detected:
-        st.error("No availability date columns were detected in Responses. Use headers like '7 June' or '21 June - Family Service'.")
+        st.error("No availability date columns were detected in Responses. Use headers like '7 June' or '2 August - Morning'.")
         st.stop()
     return detected
 
 
 def build_date_map_from_responses(responses_df: pd.DataFrame):
     date_cols = detect_availability_date_columns(responses_df)
-    month_info = []
+
+    row_info = []  # (column, day, month, session)
     for col in date_cols:
         parsed = extract_day_month_from_text(str(col))
-        if parsed:
-            day, month = parsed
-            month_info.append((col, day, month))
+        if not parsed:
+            continue
+        day, month = parsed
+        session = extract_session_from_text(str(col))
+        row_info.append((col, day, month, session))
 
-    months = {m for _, _, m in month_info}
+    months = {m for _, _, m, _ in row_info}
     if len(months) > 1:
         st.error(f"Multiple months detected in response date columns: {sorted(months)}. Please schedule one month at a time.")
         st.stop()
 
     service_month = list(months)[0]
     service_year = infer_year_from_responses(responses_df, service_month)
-    date_map = {col: pd.Timestamp(datetime(service_year, month, day)).normalize() for col, day, month in month_info}
+
+    # Each date+session combination (e.g. "2 August Morning" and
+    # "2 August Evening") is kept as its own distinct service occurrence,
+    # even though they share the same calendar date. The session is encoded
+    # as an hour on the timestamp so the two stay separate everywhere in the
+    # scheduling logic, and format_service_label() turns it back into a
+    # readable "date + session" label for display.
+    date_map = {}
+    for col, day, month, session in row_info:
+        hour = SESSION_HOUR.get(session, 12)
+        date_map[col] = pd.Timestamp(datetime(service_year, month, day, hour, 0, 0))
+
     service_dates = sorted(set(date_map.values()))
     sheet_name = f"{service_dates[0]:%B %Y}"
     return date_map, service_dates, sheet_name
@@ -835,7 +878,7 @@ def build_schedule_df(schedule_cells, slots, service_dates, people):
         row = {"Position / Slot": slot["slot_label"]}
         for d in service_dates:
             assigned = schedule_cells.get((slot["slot_id"], d), [])
-            row[d.strftime("%Y-%m-%d")] = ", ".join(people[p]["display"] for p in assigned)
+            row[format_service_label(d)] = ", ".join(people[p]["display"] for p in assigned)
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -846,7 +889,7 @@ def build_assignment_summary(schedule_cells, slots, people):
     for (slot_id, d), assigned_people in schedule_cells.items():
         slot = slot_by_id[slot_id]
         for p in assigned_people:
-            per[p].append(f"{d.strftime('%Y-%m-%d')} — {slot['slot_label']}")
+            per[p].append(f"{format_service_label(d)} — {slot['slot_label']}")
     rows = []
     for p, items in per.items():
         rows.append({
@@ -879,7 +922,7 @@ def build_unscheduled_available(schedule_cells, service_dates, people, availabil
         max_len = max(max_len, len(names))
     data = {}
     for d in service_dates:
-        date_label = d.strftime("%Y-%m-%d")
+        date_label = format_service_label(d)
         data[date_label] = [x[1] for x in per_date[d]] + [""] * (max_len - len(per_date[d]))
         data[f"{date_label} campus"] = [x[2] for x in per_date[d]] + [""] * (max_len - len(per_date[d]))
         data[f"{date_label} group"] = [x[3] for x in per_date[d]] + [""] * (max_len - len(per_date[d]))
@@ -889,7 +932,7 @@ def build_unscheduled_available(schedule_cells, service_dates, people, availabil
 def build_detected_dates_df(date_map):
     return pd.DataFrame({
         "Response column": list(date_map.keys()),
-        "Service date": [d.strftime("%Y-%m-%d") for d in date_map.values()],
+        "Service date": [format_service_label(d) for d in date_map.values()],
     })
 
 
@@ -924,6 +967,7 @@ include_campuses = st.multiselect(
 
 st.caption(f"• Source tabs: {FIXED_RESPONSES_TAB}, {FIXED_SERVINGBASE_TAB}, {FIXED_MAPPING_TAB}.")
 st.caption("• Mapping sheet now supports campus-specific columns like UC SG#, UC Position#, TGB SG#, TGB Position#, etc.")
+st.caption("• Response columns like '2 August - Morning' and '2 August - Evening' are treated as two separate services on the same date.")
 st.caption(f"• Output tab: {FIXED_OUTPUT_TAB}.")
 st.caption("• Brooklyn is filled by UC people only where their own priority codes contain the Brooklyn role code.")
 st.caption("• Nobody is ignored. Directors are included if they have valid priority codes and availability responses.")
