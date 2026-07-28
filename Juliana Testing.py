@@ -114,6 +114,17 @@ CAMPUS_LABELS = {
     "NEL": "Nelspruit",
     "POL": "Polokwane",
 }
+# Which services each campus actually runs. Tygerberg, Nelspruit and
+# Polokwane are Evening-only — no Morning slots should ever be generated
+# for them, even if a Mapping sheet capacity column would otherwise imply
+# some. A campus not listed here defaults to running both services.
+CAMPUS_SESSIONS = {
+    "UC": {"Morning", "Evening"},
+    "BRK": {"Morning", "Evening"},
+    "TGB": {"Evening"},
+    "NEL": {"Evening"},
+    "POL": {"Evening"},
+}
 DIRECTOR_CODES = set()  # Directors are not ignored in this version.
 ADMIN_VALUES = {"", "N/A", "NA", "NONE", "NAN", "-"}
 PRIORITY_COLS = [
@@ -296,7 +307,7 @@ def get_or_create_worksheet(sh, title: str, rows: int = 1000, cols: int = 50):
         return sh.add_worksheet(title=title, rows=rows, cols=cols)
 
 
-def write_output_to_google_sheet(schedule_df, assignment_df, unscheduled_df, detected_dates_df, few_yes_df, unmet_p1_df, unknown_codes_df, meta_rows):
+def write_output_to_google_sheet(schedule_morning_df, schedule_evening_df, assignment_df, unscheduled_df, detected_dates_df, few_yes_df, unmet_p1_df, unknown_codes_df, meta_rows):
     sh = open_workbook()
     ws = get_or_create_worksheet(sh, FIXED_OUTPUT_TAB, rows=1000, cols=80)
     ws.clear()
@@ -307,7 +318,8 @@ def write_output_to_google_sheet(schedule_df, assignment_df, unscheduled_df, det
     output.append([])
 
     sections = [
-        ("Schedule", schedule_df),
+        ("Schedule - Morning", schedule_morning_df),
+        ("Schedule - Evening", schedule_evening_df),
         ("Assignment Summary", assignment_df),
         ("Unscheduled but Available", unscheduled_df),
         ("Detected Dates", detected_dates_df),
@@ -765,10 +777,11 @@ def parse_availability(responses_df: pd.DataFrame, people: dict, date_map: dict)
 def build_role_slots(mapping: dict, include_campuses: list[str]):
     slots = []
     for campus in include_campuses:
+        allowed_sessions = CAMPUS_SESSIONS.get(campus, {"Morning", "Evening"})
         for code, info in mapping.items():
             campus_caps = info["capacities"].get(campus, {})
-            morning_cap = campus_caps.get("Morning", 0)
-            evening_cap = campus_caps.get("Evening", 0)
+            morning_cap = campus_caps.get("Morning", 0) if "Morning" in allowed_sessions else 0
+            evening_cap = campus_caps.get("Evening", 0) if "Evening" in allowed_sessions else 0
             max_cap = max(morning_cap, evening_cap)
             if max_cap <= 0:
                 continue
@@ -1183,6 +1196,7 @@ include_campuses = st.multiselect(
 st.caption(f"• Source tabs: {FIXED_RESPONSES_TAB}, {FIXED_SERVINGBASE_TAB}, {FIXED_MAPPING_TAB}.")
 st.caption("• Mapping sheet now supports campus-specific columns like UC SG#, UC Position#, TGB SG#, TGB Position#, etc.")
 st.caption("• A campus can also have separate Morning and Evening columns (e.g. 'Morning UC SG#', 'Evening UC SG#') if it needs fewer positions for one service than the other.")
+st.caption("• Tygerberg, Nelspruit and Polokwane run evening services only — no Morning positions are ever generated for them.")
 st.caption("• Response columns like '2 August - Morning' and '2 August - Evening' are treated as two separate services on the same date.")
 st.caption("• Girls marked 'Yes' in the Same day serving column get priority to serve both the morning and evening on a date, but only for dates they actually marked available for both.")
 st.caption("• The Excel download is split into two files — one for Morning services, one for Evening services.")
@@ -1229,7 +1243,11 @@ if st.button("Generate Schedule", type="primary"):
         include_campuses=include_campuses,
     )
 
-    schedule_df = build_schedule_df(schedule_cells, slots, service_dates, people)
+    session_groups = split_dates_by_session(service_dates)
+    morning_slots = [s for s in slots if "Morning" in s["available_sessions"]]
+    evening_slots = [s for s in slots if "Evening" in s["available_sessions"]]
+    schedule_morning_df = build_schedule_df(schedule_cells, morning_slots, session_groups["Morning"], people)
+    schedule_evening_df = build_schedule_df(schedule_cells, evening_slots, session_groups["Evening"], people)
     assignment_df = build_assignment_summary(schedule_cells, slots, people)
     unscheduled_df = build_unscheduled_available(schedule_cells, service_dates, people, availability)
     detected_dates_df = build_detected_dates_df(date_map)
@@ -1268,7 +1286,8 @@ if st.button("Generate Schedule", type="primary"):
 
     try:
         output_url = write_output_to_google_sheet(
-            schedule_df=schedule_df,
+            schedule_morning_df=schedule_morning_df,
+            schedule_evening_df=schedule_evening_df,
             assignment_df=assignment_df,
             unscheduled_df=unscheduled_df,
             detected_dates_df=detected_dates_df,
@@ -1301,8 +1320,11 @@ if st.button("Generate Schedule", type="primary"):
         st.warning("Some ServingBase codes were not found in the Mapping sheet and were ignored.")
         st.dataframe(unknown_codes_df, use_container_width=True)
 
-    st.subheader("Schedule")
-    st.dataframe(schedule_df, use_container_width=True)
+    st.subheader("Schedule - Morning")
+    st.dataframe(schedule_morning_df, use_container_width=True)
+
+    st.subheader("Schedule - Evening")
+    st.dataframe(schedule_evening_df, use_container_width=True)
 
     st.subheader("Assignment Summary")
     st.dataframe(assignment_df, use_container_width=True)
@@ -1328,7 +1350,8 @@ if st.button("Generate Schedule", type="primary"):
 
     def build_session_workbook(session_label, session_dates):
         allowed_set = set(session_dates)
-        s_schedule_df = build_schedule_df(schedule_cells, slots, session_dates, people)
+        session_slots = morning_slots if session_label == "Morning" else evening_slots
+        s_schedule_df = build_schedule_df(schedule_cells, session_slots, session_dates, people)
         s_assignment_df = build_assignment_summary(schedule_cells, slots, people, allowed_dates=allowed_set)
         s_unscheduled_df = build_unscheduled_available(schedule_cells, session_dates, people, availability)
         s_detected_dates_df = build_detected_dates_df(
@@ -1355,7 +1378,6 @@ if st.button("Generate Schedule", type="primary"):
         buf.seek(0)
         return buf
 
-    session_groups = split_dates_by_session(service_dates)
     morning_buf = build_session_workbook("Morning", session_groups["Morning"])
     evening_buf = build_session_workbook("Evening", session_groups["Evening"])
 
