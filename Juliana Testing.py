@@ -129,6 +129,11 @@ PRIORITY_COLS = [
 # though they fall on the same calendar date.
 SESSION_HOUR = {"Morning": 8, "Afternoon": 13, "Evening": 18}
 
+# Nobody may be scheduled for this many services in a row (counting
+# through the whole sorted list of services, morning and evening both),
+# even if she marked herself available for all of them.
+MAX_CONSECUTIVE_SERVICES = 4
+
 # ──────────────────────────────────────────────────────────────────────────────
 # General helpers
 # ──────────────────────────────────────────────────────────────────────────────
@@ -431,15 +436,39 @@ def parse_mapping_sheet(mapping_df: pd.DataFrame):
         position_order = {}
 
         for campus in CAMPUS_ORDER:
-            sg_col = find_col([
-                f"{campus} SG#", f"{campus} SG", f"{campus} Capacity", campus
-            ])
-            pos_col = find_col([
-                f"{campus} Position#", f"{campus} Position", f"{campus} Order", f"{campus} Sort"
-            ])
+            # Shared, session-agnostic columns (still used by campuses that
+            # only run one service, or haven't split Morning/Evening yet).
+            shared_sg_col = find_col([f"{campus} SG#", f"{campus} SG", f"{campus} Capacity", campus])
+            shared_pos_col = find_col([f"{campus} Position#", f"{campus} Position", f"{campus} Order", f"{campus} Sort"])
+            shared_cap = to_int_capacity(row.get(shared_sg_col, 0)) if shared_sg_col else 0
+            shared_pos = to_int_capacity(row.get(shared_pos_col, 9999)) if shared_pos_col else 9999
 
-            capacities[campus] = to_int_capacity(row.get(sg_col, 0)) if sg_col else 0
-            position_order[campus] = to_int_capacity(row.get(pos_col, 9999)) if pos_col else 9999
+            session_caps = {}
+            session_positions = {}
+            for session in ("Morning", "Evening"):
+                sg_col = find_col([
+                    f"{session} {campus} SG#", f"{session} {campus} SG", f"{session} {campus} Capacity",
+                ])
+                pos_col = find_col([
+                    f"{session} {campus} Position#", f"{session} {campus} Position",
+                    f"{session} {campus} Order", f"{session} {campus} Sort",
+                ])
+                if sg_col:
+                    session_caps[session] = to_int_capacity(row.get(sg_col, 0))
+                if pos_col:
+                    session_positions[session] = to_int_capacity(row.get(pos_col, 9999))
+
+            # A campus with dedicated Morning/Evening columns uses those; one
+            # without them (no split yet) uses the same shared number for
+            # both services.
+            capacities[campus] = {
+                "Morning": session_caps.get("Morning", shared_cap),
+                "Evening": session_caps.get("Evening", shared_cap),
+            }
+            position_order[campus] = {
+                "Morning": session_positions.get("Morning", shared_pos),
+                "Evening": session_positions.get("Evening", shared_pos),
+            }
 
         mapping[code] = {
             "code": code,
@@ -737,12 +766,26 @@ def build_role_slots(mapping: dict, include_campuses: list[str]):
     slots = []
     for campus in include_campuses:
         for code, info in mapping.items():
-            capacity = info["capacities"].get(campus, 0)
-            if capacity <= 0:
+            campus_caps = info["capacities"].get(campus, {})
+            morning_cap = campus_caps.get("Morning", 0)
+            evening_cap = campus_caps.get("Evening", 0)
+            max_cap = max(morning_cap, evening_cap)
+            if max_cap <= 0:
                 continue
-            for idx in range(1, capacity + 1):
+
+            campus_positions = info.get("position_order", {}).get(campus, {})
+            sort_position = min([v for v in campus_positions.values() if v is not None] or [9999])
+
+            for idx in range(1, max_cap + 1):
                 slot_id = f"{campus}|{code}|{idx}"
-                slot_label = f"{campus} - {info['display']}" if capacity == 1 else f"{campus} - {info['display']} #{idx}"
+                slot_label = f"{campus} - {info['display']}" if max_cap == 1 else f"{campus} - {info['display']} #{idx}"
+                # Which sessions actually have this numbered slot — e.g. if
+                # the evening only needs 1 of a role but the morning needs 2,
+                # slot #2 is available for Morning only.
+                available_sessions = {
+                    session for session, cap in (("Morning", morning_cap), ("Evening", evening_cap))
+                    if idx <= cap
+                }
                 slots.append({
                     "slot_id": slot_id,
                     "campus": campus,
@@ -750,7 +793,8 @@ def build_role_slots(mapping: dict, include_campuses: list[str]):
                     "display": info["display"],
                     "slot_label": slot_label,
                     "is_leader": info["is_leader"],
-                    "sort_key": (CAMPUS_ORDER.index(campus), info.get("position_order", {}).get(campus, 9999), normalize(info["display"]), idx),
+                    "available_sessions": available_sessions,
+                    "sort_key": (CAMPUS_ORDER.index(campus), sort_position, normalize(info["display"]), idx),
                 })
     slots.sort(key=lambda x: x["sort_key"])
     return slots
@@ -788,6 +832,26 @@ def is_assigned_on_date(schedule_cells, person, service_date):
     return any(person in names for (_slot_id, d), names in schedule_cells.items() if d == service_date)
 
 
+def exceeds_consecutive_limit(schedule_cells, person, target_date, service_dates_sorted, limit=MAX_CONSECUTIVE_SERVICES):
+    """Would assigning `person` to `target_date` create a run of `limit` or
+    more services in a row (walking through every service — morning and
+    evening both — in chronological order)? This applies even when she is
+    marked available for all of them."""
+    if target_date not in service_dates_sorted:
+        return False
+    idx = service_dates_sorted.index(target_date)
+    run = 1
+    i = idx - 1
+    while i >= 0 and is_assigned_on_date(schedule_cells, person, service_dates_sorted[i]):
+        run += 1
+        i -= 1
+    i = idx + 1
+    while i < len(service_dates_sorted) and is_assigned_on_date(schedule_cells, person, service_dates_sorted[i]):
+        run += 1
+        i += 1
+    return run >= limit
+
+
 def session_for_ts(dt: pd.Timestamp):
     return {v: k for k, v in SESSION_HOUR.items()}.get(dt.hour)
 
@@ -804,7 +868,7 @@ def build_session_pairs(service_dates):
     return pairs
 
 
-def apply_same_day_pairing(people, people_order, slots, schedule_cells, availability, assign_count, monthly_cap, leader_group, session_pairs):
+def apply_same_day_pairing(people, people_order, slots, schedule_cells, availability, assign_count, monthly_cap, leader_group, session_pairs, service_dates_sorted):
     """For girls who marked 'Same day serving', if she's already scheduled for
     one session on a date, try to also place her in the other session on that
     same date — but only into a still-open slot she is genuinely eligible and
@@ -828,7 +892,9 @@ def apply_same_day_pairing(people, people_order, slots, schedule_cells, availabi
             target_date = evening_ts if assigned_morning else morning_ts
             candidate_slots = [
                 s for s in slots
-                if s["code"] in person_info["all_codes"] and not schedule_cells[(s["slot_id"], target_date)]
+                if s["code"] in person_info["all_codes"]
+                and (s["slot_id"], target_date) in schedule_cells
+                and not schedule_cells[(s["slot_id"], target_date)]
             ]
             candidate_slots.sort(key=lambda s: (0 if s["campus"] == person_info["campus"] else 1, s["sort_key"]))
             for slot in candidate_slots:
@@ -842,13 +908,14 @@ def apply_same_day_pairing(people, people_order, slots, schedule_cells, availabi
                     assign_count=assign_count,
                     monthly_cap=monthly_cap,
                     leader_group=leader_group,
+                    service_dates_sorted=service_dates_sorted,
                 ):
                     schedule_cells[(slot["slot_id"], target_date)].append(person)
                     assign_count[person] += 1
                     break
 
 
-def can_assign(*, person, person_info, slot, service_date, schedule_cells, availability, assign_count, monthly_cap, leader_group):
+def can_assign(*, person, person_info, slot, service_date, schedule_cells, availability, assign_count, monthly_cap, leader_group, service_dates_sorted):
     if assign_count.get(person, 0) >= monthly_cap:
         return False
     if is_assigned_on_date(schedule_cells, person, service_date):
@@ -860,6 +927,8 @@ def can_assign(*, person, person_info, slot, service_date, schedule_cells, avail
     if not campus_allowed_for_role(person_info, slot):
         return False
     if not group_allowed_for_role(person_info, slot, leader_group):
+        return False
+    if exceeds_consecutive_limit(schedule_cells, person, service_date, service_dates_sorted):
         return False
     return True
 
@@ -880,7 +949,15 @@ def candidate_sort_key(person, person_info, priority, assign_count, availability
 # ──────────────────────────────────────────────────────────────────────────────
 def generate_schedule(people, mapping, availability, service_dates, monthly_cap, leader_group, include_campuses):
     slots = build_role_slots(mapping, include_campuses)
-    schedule_cells = {(slot["slot_id"], d): [] for slot in slots for d in service_dates}
+    schedule_cells = {}
+    for slot in slots:
+        for d in service_dates:
+            session = session_for_ts(d)
+            # A date with no recognised session (older single-service sheets)
+            # is always in scope; otherwise the slot instance only exists for
+            # the sessions its capacity actually covers.
+            if session is None or session in slot["available_sessions"]:
+                schedule_cells[(slot["slot_id"], d)] = []
     assign_count = Counter()
     slots_by_id = {s["slot_id"]: s for s in slots}
 
@@ -893,6 +970,7 @@ def generate_schedule(people, mapping, availability, service_dates, monthly_cap,
     )
 
     session_pairs = build_session_pairs(service_dates)
+    service_dates_sorted = sorted(service_dates)
 
     # Pass 1: try to give every person one first-priority assignment.
     for person in people_order:
@@ -908,7 +986,9 @@ def generate_schedule(people, mapping, availability, service_dates, monthly_cap,
                 continue
             candidate_slots = [
                 s for s in slots
-                if s["code"] in p1_codes and not schedule_cells[(s["slot_id"], service_date)]
+                if s["code"] in p1_codes
+                and (s["slot_id"], service_date) in schedule_cells
+                and not schedule_cells[(s["slot_id"], service_date)]
             ]
             candidate_slots.sort(key=lambda s: (0 if s["campus"] == person_info["campus"] else 1, s["sort_key"]))
             for slot in candidate_slots:
@@ -922,6 +1002,7 @@ def generate_schedule(people, mapping, availability, service_dates, monthly_cap,
                     assign_count=assign_count,
                     monthly_cap=monthly_cap,
                     leader_group=leader_group,
+                    service_dates_sorted=service_dates_sorted,
                 ):
                     schedule_cells[(slot["slot_id"], service_date)].append(person)
                     assign_count[person] += 1
@@ -940,12 +1021,15 @@ def generate_schedule(people, mapping, availability, service_dates, monthly_cap,
         monthly_cap=monthly_cap,
         leader_group=leader_group,
         session_pairs=session_pairs,
+        service_dates_sorted=service_dates_sorted,
     )
 
     # Pass 2: fill all remaining slots by priority 1 to 5.
     for service_date in service_dates:
         for slot in slots:
             key = (slot["slot_id"], service_date)
+            if key not in schedule_cells:
+                continue
             if schedule_cells[key]:
                 continue
             candidates = []
@@ -963,6 +1047,7 @@ def generate_schedule(people, mapping, availability, service_dates, monthly_cap,
                     assign_count=assign_count,
                     monthly_cap=monthly_cap,
                     leader_group=leader_group,
+                    service_dates_sorted=service_dates_sorted,
                 ):
                     continue
                 candidates.append((person, priority))
@@ -984,6 +1069,7 @@ def generate_schedule(people, mapping, availability, service_dates, monthly_cap,
         monthly_cap=monthly_cap,
         leader_group=leader_group,
         session_pairs=session_pairs,
+        service_dates_sorted=service_dates_sorted,
     )
 
     served_p1 = set()
@@ -1096,9 +1182,11 @@ include_campuses = st.multiselect(
 
 st.caption(f"• Source tabs: {FIXED_RESPONSES_TAB}, {FIXED_SERVINGBASE_TAB}, {FIXED_MAPPING_TAB}.")
 st.caption("• Mapping sheet now supports campus-specific columns like UC SG#, UC Position#, TGB SG#, TGB Position#, etc.")
+st.caption("• A campus can also have separate Morning and Evening columns (e.g. 'Morning UC SG#', 'Evening UC SG#') if it needs fewer positions for one service than the other.")
 st.caption("• Response columns like '2 August - Morning' and '2 August - Evening' are treated as two separate services on the same date.")
 st.caption("• Girls marked 'Yes' in the Same day serving column get priority to serve both the morning and evening on a date, but only for dates they actually marked available for both.")
 st.caption("• The Excel download is split into two files — one for Morning services, one for Evening services.")
+st.caption("• Nobody is scheduled for more than 4 services in a row, even if her availability would allow it.")
 st.caption(f"• Output tab: {FIXED_OUTPUT_TAB}.")
 st.caption("• Brooklyn is filled by UC people only where their own priority codes contain the Brooklyn role code.")
 st.caption("• Nobody is ignored. Directors are included if they have valid priority codes and availability responses.")
@@ -1162,7 +1250,7 @@ if st.button("Generate Schedule", type="primary"):
     else:
         unmet_p1_df = pd.DataFrame(columns=["Person", "Campus", "Group"])
 
-    total_slots = len(slots) * len(service_dates)
+    total_slots = len(schedule_cells)
     filled_slots = sum(1 for names in schedule_cells.values() if names)
     fill_rate = filled_slots / total_slots if total_slots else 0
 
