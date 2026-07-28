@@ -379,6 +379,19 @@ def detect_availability_month_column(df: pd.DataFrame):
         label="availability month column",
     )
 
+
+def detect_same_day_column(df: pd.DataFrame):
+    """The optional 'Same day serving' column in Responses: girls who tick
+    this prefer to serve both the morning and evening service on a date
+    they're available for both — but only when they've actually submitted
+    both as available, never overriding what they submitted."""
+    return get_column_by_candidates(
+        df,
+        ["Same day serving", "Same Day", "Same-day serving", "Same day preference", "Prefers same day", "Serve same day"],
+        required=False,
+        label="same-day serving preference column",
+    )
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Mapping sheet parsing
 # ──────────────────────────────────────────────────────────────────────────────
@@ -525,6 +538,7 @@ def parse_serving_base(serving_df: pd.DataFrame, mapping: dict):
             "group": group,
             "priorities": {p: sorted(codes) for p, codes in priorities.items()},
             "all_codes": all_codes,
+            "same_day_pref": False,
         }
 
     if not people:
@@ -569,6 +583,24 @@ def format_service_label(dt: pd.Timestamp) -> str:
     return f"{base} {session}" if session else base
 
 
+def split_dates_by_session(service_dates):
+    """Split service dates into a Morning group and an Evening group, for
+    building two separate roster Excel files. A date with no recognised
+    session (older single-service-per-day sheets) is included in both
+    groups so nothing silently disappears from either file."""
+    groups = {"Morning": [], "Evening": []}
+    for d in sorted(service_dates):
+        session = session_for_ts(d)
+        if session == "Morning":
+            groups["Morning"].append(d)
+        elif session == "Evening":
+            groups["Evening"].append(d)
+        else:
+            groups["Morning"].append(d)
+            groups["Evening"].append(d)
+    return groups
+
+
 def infer_year_from_responses(responses_df: pd.DataFrame, service_month: int) -> int:
     month_col = detect_availability_month_column(responses_df)
     if month_col:
@@ -601,7 +633,7 @@ def infer_year_from_responses(responses_df: pd.DataFrame, service_month: int) ->
 def detect_availability_date_columns(responses_df: pd.DataFrame):
     admin_norm = {normalize(x) for x in [
         "timestamp", "time stamp", "availability", "availability month", "month",
-        "director", "serving girl", "serving girl name", "reason",
+        "director", "serving girl", "serving girl name", "reason", "same day serving",
     ]}
     detected = []
     for col in responses_df.columns:
@@ -671,9 +703,11 @@ def dedupe_latest_responses(responses_df: pd.DataFrame, person_col: str):
 
 def parse_availability(responses_df: pd.DataFrame, people: dict, date_map: dict):
     person_col = detect_serving_girl_column(responses_df)
+    same_day_col = detect_same_day_column(responses_df)
     latest = dedupe_latest_responses(responses_df, person_col)
     availability = {person: {dt: False for dt in date_map.values()} for person in people.keys()}
     display_from_responses = {}
+    same_day_pref = {}
     yes_counts = Counter()
     responders_not_in_base = set()
 
@@ -684,6 +718,8 @@ def parse_availability(responses_df: pd.DataFrame, people: dict, date_map: dict)
                 responders_not_in_base.add(clean_text(row.get(person_col, "")))
             continue
         display_from_responses[person] = clean_text(row.get(person_col, ""))
+        if same_day_col:
+            same_day_pref[person] = clean_text(row.get(same_day_col, "")).strip().lower() in YES_SET
         for col, dt in date_map.items():
             ans = clean_text(row.get(col, "")).lower()
             is_yes = ans in YES_SET
@@ -692,7 +728,7 @@ def parse_availability(responses_df: pd.DataFrame, people: dict, date_map: dict)
                 yes_counts[person] += 1
 
     few_yes = sorted([p for p in people.keys() if yes_counts[p] < 2])
-    return availability, few_yes, display_from_responses, sorted(responders_not_in_base)
+    return availability, few_yes, display_from_responses, sorted(responders_not_in_base), same_day_pref
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Slot building
@@ -752,6 +788,66 @@ def is_assigned_on_date(schedule_cells, person, service_date):
     return any(person in names for (_slot_id, d), names in schedule_cells.items() if d == service_date)
 
 
+def session_for_ts(dt: pd.Timestamp):
+    return {v: k for k, v in SESSION_HOUR.items()}.get(dt.hour)
+
+
+def build_session_pairs(service_dates):
+    """Group service dates by calendar day, so a Morning timestamp and an
+    Evening timestamp that fall on the same date can be matched up."""
+    pairs = {}
+    for d in service_dates:
+        session = session_for_ts(d)
+        if session not in ("Morning", "Evening"):
+            continue
+        pairs.setdefault(d.date(), {})[session] = d
+    return pairs
+
+
+def apply_same_day_pairing(people, people_order, slots, schedule_cells, availability, assign_count, monthly_cap, leader_group, session_pairs):
+    """For girls who marked 'Same day serving', if she's already scheduled for
+    one session on a date, try to also place her in the other session on that
+    same date — but only into a still-open slot she is genuinely eligible and
+    available for. This never overrides what she actually submitted: can_assign
+    still checks her real availability answers, so she can only be paired into
+    a session she said Yes to."""
+    for person in people_order:
+        person_info = people[person]
+        if not person_info.get("same_day_pref"):
+            continue
+        for _date_key, sessions in session_pairs.items():
+            morning_ts = sessions.get("Morning")
+            evening_ts = sessions.get("Evening")
+            if morning_ts is None or evening_ts is None:
+                continue
+            assigned_morning = is_assigned_on_date(schedule_cells, person, morning_ts)
+            assigned_evening = is_assigned_on_date(schedule_cells, person, evening_ts)
+            if assigned_morning == assigned_evening:
+                continue  # nothing to pair: either both or neither are filled
+
+            target_date = evening_ts if assigned_morning else morning_ts
+            candidate_slots = [
+                s for s in slots
+                if s["code"] in person_info["all_codes"] and not schedule_cells[(s["slot_id"], target_date)]
+            ]
+            candidate_slots.sort(key=lambda s: (0 if s["campus"] == person_info["campus"] else 1, s["sort_key"]))
+            for slot in candidate_slots:
+                if can_assign(
+                    person=person,
+                    person_info=person_info,
+                    slot=slot,
+                    service_date=target_date,
+                    schedule_cells=schedule_cells,
+                    availability=availability,
+                    assign_count=assign_count,
+                    monthly_cap=monthly_cap,
+                    leader_group=leader_group,
+                ):
+                    schedule_cells[(slot["slot_id"], target_date)].append(person)
+                    assign_count[person] += 1
+                    break
+
+
 def can_assign(*, person, person_info, slot, service_date, schedule_cells, availability, assign_count, monthly_cap, leader_group):
     if assign_count.get(person, 0) >= monthly_cap:
         return False
@@ -796,6 +892,8 @@ def generate_schedule(people, mapping, availability, service_dates, monthly_cap,
         ),
     )
 
+    session_pairs = build_session_pairs(service_dates)
+
     # Pass 1: try to give every person one first-priority assignment.
     for person in people_order:
         person_info = people[person]
@@ -830,6 +928,20 @@ def generate_schedule(people, mapping, availability, service_dates, monthly_cap,
                     assigned = True
                     break
 
+    # Pass 1.5: give same-day-preference girls first refusal on the paired
+    # morning/evening slot before general filling starts.
+    apply_same_day_pairing(
+        people=people,
+        people_order=people_order,
+        slots=slots,
+        schedule_cells=schedule_cells,
+        availability=availability,
+        assign_count=assign_count,
+        monthly_cap=monthly_cap,
+        leader_group=leader_group,
+        session_pairs=session_pairs,
+    )
+
     # Pass 2: fill all remaining slots by priority 1 to 5.
     for service_date in service_dates:
         for slot in slots:
@@ -860,6 +972,20 @@ def generate_schedule(people, mapping, availability, service_dates, monthly_cap,
                 schedule_cells[key].append(chosen)
                 assign_count[chosen] += 1
 
+    # Pass 2.5: catch same-day-preference girls who only picked up an
+    # assignment during the general fill pass above.
+    apply_same_day_pairing(
+        people=people,
+        people_order=people_order,
+        slots=slots,
+        schedule_cells=schedule_cells,
+        availability=availability,
+        assign_count=assign_count,
+        monthly_cap=monthly_cap,
+        leader_group=leader_group,
+        session_pairs=session_pairs,
+    )
+
     served_p1 = set()
     for (slot_id, _d), assigned_people in schedule_cells.items():
         slot = slots_by_id[slot_id]
@@ -883,10 +1009,12 @@ def build_schedule_df(schedule_cells, slots, service_dates, people):
     return pd.DataFrame(rows)
 
 
-def build_assignment_summary(schedule_cells, slots, people):
+def build_assignment_summary(schedule_cells, slots, people, allowed_dates=None):
     slot_by_id = {s["slot_id"]: s for s in slots}
     per = defaultdict(list)
     for (slot_id, d), assigned_people in schedule_cells.items():
+        if allowed_dates is not None and d not in allowed_dates:
+            continue
         slot = slot_by_id[slot_id]
         for p in assigned_people:
             per[p].append(f"{format_service_label(d)} — {slot['slot_label']}")
@@ -896,12 +1024,13 @@ def build_assignment_summary(schedule_cells, slots, people):
             "Person": people[p]["display"],
             "Campus": people[p]["campus"],
             "Group": people[p]["group"],
+            "Same-day pref": "Yes" if people[p].get("same_day_pref") else "No",
             "Assignments": len(items),
             "Locations & Dates": "; ".join(items),
         })
     df = pd.DataFrame(rows)
     if df.empty:
-        return pd.DataFrame(columns=["Person", "Campus", "Group", "Assignments", "Locations & Dates"])
+        return pd.DataFrame(columns=["Person", "Campus", "Group", "Same-day pref", "Assignments", "Locations & Dates"])
     return df.sort_values(["Assignments", "Person"], ascending=[False, True]).reset_index(drop=True)
 
 
@@ -968,6 +1097,8 @@ include_campuses = st.multiselect(
 st.caption(f"• Source tabs: {FIXED_RESPONSES_TAB}, {FIXED_SERVINGBASE_TAB}, {FIXED_MAPPING_TAB}.")
 st.caption("• Mapping sheet now supports campus-specific columns like UC SG#, UC Position#, TGB SG#, TGB Position#, etc.")
 st.caption("• Response columns like '2 August - Morning' and '2 August - Evening' are treated as two separate services on the same date.")
+st.caption("• Girls marked 'Yes' in the Same day serving column get priority to serve both the morning and evening on a date, but only for dates they actually marked available for both.")
+st.caption("• The Excel download is split into two files — one for Morning services, one for Evening services.")
 st.caption(f"• Output tab: {FIXED_OUTPUT_TAB}.")
 st.caption("• Brooklyn is filled by UC people only where their own priority codes contain the Brooklyn role code.")
 st.caption("• Nobody is ignored. Directors are included if they have valid priority codes and availability responses.")
@@ -990,11 +1121,15 @@ if st.button("Generate Schedule", type="primary"):
     mapping = parse_mapping_sheet(mapping_df)
     people, ignored_directors, unknown_codes = parse_serving_base(serving_df, mapping)
     date_map, service_dates, sheet_name = build_date_map_from_responses(responses_df)
-    availability, few_yes, display_from_responses, responders_not_in_base = parse_availability(responses_df, people, date_map)
+    availability, few_yes, display_from_responses, responders_not_in_base, same_day_pref = parse_availability(responses_df, people, date_map)
 
     for person, display in display_from_responses.items():
         if person in people and display:
             people[person]["display"] = display
+
+    for person, pref in same_day_pref.items():
+        if person in people:
+            people[person]["same_day_pref"] = pref
 
     schedule_cells, assign_count, slots, unmet_p1 = generate_schedule(
         people=people,
@@ -1093,11 +1228,7 @@ if st.button("Generate Schedule", type="primary"):
     st.subheader("Unscheduled but Available")
     st.dataframe(unscheduled_df, use_container_width=True)
 
-    wb = Workbook()
-    if "Sheet" in wb.sheetnames:
-        wb.remove(wb["Sheet"])
-
-    def write_df(ws_name, df):
+    def write_df(wb, ws_name, df):
         ws = wb.create_sheet(ws_name[:31])
         if df.empty:
             ws.append(["No data"])
@@ -1107,25 +1238,54 @@ if st.button("Generate Schedule", type="primary"):
                 ws.append([row.get(col, "") for col in df.columns])
         excel_autofit(ws)
 
-    write_df(sheet_name, schedule_df)
-    write_df("Assignment Summary", assignment_df)
-    write_df("Detected Dates", detected_dates_df)
-    write_df("Fewer than 2 Yes", few_yes_df)
-    write_df("Unmet Priority 1", unmet_p1_df)
-    write_df("Unscheduled", unscheduled_df)
-    if not unknown_codes_df.empty:
-        write_df("Unknown Codes", unknown_codes_df)
-    if responders_not_in_base:
-        write_df("Names Not In Base", build_not_in_base_df(responders_not_in_base))
+    def build_session_workbook(session_label, session_dates):
+        allowed_set = set(session_dates)
+        s_schedule_df = build_schedule_df(schedule_cells, slots, session_dates, people)
+        s_assignment_df = build_assignment_summary(schedule_cells, slots, people, allowed_dates=allowed_set)
+        s_unscheduled_df = build_unscheduled_available(schedule_cells, session_dates, people, availability)
+        s_detected_dates_df = build_detected_dates_df(
+            {col: d for col, d in date_map.items() if d in allowed_set}
+        )
 
-    buf = io.BytesIO()
-    wb.save(buf)
-    buf.seek(0)
-    st.download_button(
-        "Download Excel (.xlsx)",
-        data=buf,
-        file_name=f"uKids_schedule_{sheet_name.replace(' ', '_')}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+        wb = Workbook()
+        if "Sheet" in wb.sheetnames:
+            wb.remove(wb["Sheet"])
+
+        write_df(wb, f"{sheet_name} {session_label}", s_schedule_df)
+        write_df(wb, "Assignment Summary", s_assignment_df)
+        write_df(wb, "Detected Dates", s_detected_dates_df)
+        write_df(wb, "Fewer than 2 Yes", few_yes_df)
+        write_df(wb, "Unmet Priority 1", unmet_p1_df)
+        write_df(wb, "Unscheduled", s_unscheduled_df)
+        if not unknown_codes_df.empty:
+            write_df(wb, "Unknown Codes", unknown_codes_df)
+        if responders_not_in_base:
+            write_df(wb, "Names Not In Base", build_not_in_base_df(responders_not_in_base))
+
+        buf = io.BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+        return buf
+
+    session_groups = split_dates_by_session(service_dates)
+    morning_buf = build_session_workbook("Morning", session_groups["Morning"])
+    evening_buf = build_session_workbook("Evening", session_groups["Evening"])
+
+    st.subheader("Download rosters")
+    dl_col1, dl_col2 = st.columns(2)
+    with dl_col1:
+        st.download_button(
+            "Download Morning Excel (.xlsx)",
+            data=morning_buf,
+            file_name=f"uKids_schedule_{sheet_name.replace(' ', '_')}_Morning.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    with dl_col2:
+        st.download_button(
+            "Download Evening Excel (.xlsx)",
+            data=evening_buf,
+            file_name=f"uKids_schedule_{sheet_name.replace(' ', '_')}_Evening.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 else:
     st.info("Choose the settings, then click **Generate Schedule**.")
